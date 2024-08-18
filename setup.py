@@ -34,8 +34,9 @@ def embed_commit_hash():
             # ci build
             commit_id = os.environ["BUILDKITE_COMMIT"]
         else:
-            commit_id = subprocess.check_output(["git", "rev-parse", "HEAD"],
-                                                encoding="utf-8").strip()
+            commit_id = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], encoding="utf-8"
+            ).strip()
 
         commit_contents = f'__commit__ = "{commit_id}"\n'
 
@@ -44,20 +45,18 @@ def embed_commit_hash():
             f.write(commit_contents)
 
     except subprocess.CalledProcessError as e:
-        warnings.warn(f"Failed to get commit hash:\n{e}",
-                      RuntimeWarning,
-                      stacklevel=2)
+        warnings.warn(f"Failed to get commit hash:\n{e}", RuntimeWarning, stacklevel=2)
     except Exception as e:
-        warnings.warn(f"Failed to embed commit hash:\n{e}",
-                      RuntimeWarning,
-                      stacklevel=2)
+        warnings.warn(
+            f"Failed to embed commit hash:\n{e}", RuntimeWarning, stacklevel=2
+        )
 
 
 embed_commit_hash()
 
 # cannot import envs directly because it depends on vllm,
 #  which is not installed yet
-envs = load_module_from_path('envs', os.path.join(ROOT_DIR, 'vllm', 'envs.py'))
+envs = load_module_from_path("envs", os.path.join(ROOT_DIR, "vllm", "envs.py"))
 
 VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
 
@@ -65,7 +64,9 @@ if not sys.platform.startswith("linux"):
     logger.warning(
         "vLLM only supports Linux platform (including WSL). "
         "Building on %s, "
-        "so vLLM may not be able to run correctly", sys.platform)
+        "so vLLM may not be able to run correctly",
+        sys.platform,
+    )
     VLLM_TARGET_DEVICE = "empty"
 
 MAIN_CUDA_VERSION = "12.1"
@@ -85,13 +86,13 @@ def is_ninja_available() -> bool:
 
 def remove_prefix(text, prefix):
     if text.startswith(prefix):
-        return text[len(prefix):]
+        return text[len(prefix) :]
     return text
 
 
 class CMakeExtension(Extension):
 
-    def __init__(self, name: str, cmake_lists_dir: str = '.', **kwa) -> None:
+    def __init__(self, name: str, cmake_lists_dir: str = ".", **kwa) -> None:
         super().__init__(name, sources=[], py_limited_api=True, **kwa)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
@@ -128,8 +129,8 @@ class cmake_build_ext(build_ext):
             if nvcc_threads is not None:
                 nvcc_threads = int(nvcc_threads)
                 logger.info(
-                    "Using NVCC_THREADS=%d as the number of nvcc threads.",
-                    nvcc_threads)
+                    "Using NVCC_THREADS=%d as the number of nvcc threads.", nvcc_threads
+                )
             else:
                 nvcc_threads = 1
             num_jobs = max(1, num_jobs // nvcc_threads)
@@ -154,35 +155,34 @@ class cmake_build_ext(build_ext):
 
         # where .so files will be written, should be the same for all extensions
         # that use the same CMakeLists.txt.
-        outdir = os.path.abspath(
-            os.path.dirname(self.get_ext_fullpath(ext.name)))
+        outdir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.name)))
 
         cmake_args = [
-            '-DCMAKE_BUILD_TYPE={}'.format(cfg),
-            '-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={}'.format(outdir),
-            '-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY={}'.format(self.build_temp),
-            '-DVLLM_TARGET_DEVICE={}'.format(VLLM_TARGET_DEVICE),
+            "-DCMAKE_BUILD_TYPE={}".format(cfg),
+            "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={}".format(outdir),
+            "-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY={}".format(self.build_temp),
+            "-DVLLM_TARGET_DEVICE={}".format(VLLM_TARGET_DEVICE),
         ]
 
         verbose = envs.VERBOSE
         if verbose:
-            cmake_args += ['-DCMAKE_VERBOSE_MAKEFILE=ON']
+            cmake_args += ["-DCMAKE_VERBOSE_MAKEFILE=ON"]
 
         if is_sccache_available():
             cmake_args += [
-                '-DCMAKE_CXX_COMPILER_LAUNCHER=sccache',
-                '-DCMAKE_CUDA_COMPILER_LAUNCHER=sccache',
-                '-DCMAKE_C_COMPILER_LAUNCHER=sccache',
+                "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache",
+                "-DCMAKE_CUDA_COMPILER_LAUNCHER=sccache",
+                "-DCMAKE_C_COMPILER_LAUNCHER=sccache",
             ]
         elif is_ccache_available():
             cmake_args += [
-                '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache',
-                '-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache',
+                "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
+                "-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache",
             ]
 
         # Pass the python executable to cmake so it can find an exact
         # match.
-        cmake_args += ['-DVLLM_PYTHON_EXECUTABLE={}'.format(sys.executable)]
+        cmake_args += ["-DVLLM_PYTHON_EXECUTABLE={}".format(sys.executable)]
 
         #
         # Setup parallelism and build tool
@@ -190,27 +190,28 @@ class cmake_build_ext(build_ext):
         num_jobs, nvcc_threads = self.compute_num_jobs()
 
         if nvcc_threads:
-            cmake_args += ['-DNVCC_THREADS={}'.format(nvcc_threads)]
+            cmake_args += ["-DNVCC_THREADS={}".format(nvcc_threads)]
 
         if is_ninja_available():
-            build_tool = ['-G', 'Ninja']
+            build_tool = ["-G", "Ninja"]
             cmake_args += [
-                '-DCMAKE_JOB_POOL_COMPILE:STRING=compile',
-                '-DCMAKE_JOB_POOLS:STRING=compile={}'.format(num_jobs),
+                "-DCMAKE_JOB_POOL_COMPILE:STRING=compile",
+                "-DCMAKE_JOB_POOLS:STRING=compile={}".format(num_jobs),
             ]
         else:
             # Default build tool to whatever cmake picks.
             build_tool = []
         subprocess.check_call(
-            ['cmake', ext.cmake_lists_dir, *build_tool, *cmake_args],
-            cwd=self.build_temp)
+            ["cmake", ext.cmake_lists_dir, *build_tool, *cmake_args],
+            cwd=self.build_temp,
+        )
 
     def build_extensions(self) -> None:
         # Ensure that CMake is present and working
         try:
-            subprocess.check_output(['cmake', '--version'])
+            subprocess.check_output(["cmake", "--version"])
         except OSError as e:
-            raise RuntimeError('Cannot find CMake executable') from e
+            raise RuntimeError("Cannot find CMake executable") from e
 
         # Create build directory if it does not exist.
         if not os.path.exists(self.build_temp):
@@ -240,13 +241,13 @@ def _no_device() -> bool:
 
 def _is_cuda() -> bool:
     has_cuda = torch.version.cuda is not None
-    return (VLLM_TARGET_DEVICE == "cuda" and has_cuda
-            and not (_is_neuron() or _is_tpu()))
+    return VLLM_TARGET_DEVICE == "cuda" and has_cuda and not (_is_neuron() or _is_tpu())
 
 
 def _is_hip() -> bool:
-    return (VLLM_TARGET_DEVICE == "cuda"
-            or VLLM_TARGET_DEVICE == "rocm") and torch.version.hip is not None
+    return (
+        VLLM_TARGET_DEVICE == "cuda" or VLLM_TARGET_DEVICE == "rocm"
+    ) and torch.version.hip is not None
 
 
 def _is_neuron() -> bool:
@@ -284,10 +285,12 @@ def _build_core_ext() -> bool:
 
 def get_hipcc_rocm_version():
     # Run the hipcc --version command
-    result = subprocess.run(['hipcc', '--version'],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            text=True)
+    result = subprocess.run(
+        ["hipcc", "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
 
     # Check if the command was executed successfully
     if result.returncode != 0:
@@ -295,7 +298,7 @@ def get_hipcc_rocm_version():
         return None
 
     # Extract the version using a regular expression
-    match = re.search(r'HIP version: (\S+)', result.stdout)
+    match = re.search(r"HIP version: (\S+)", result.stdout)
     if match:
         # Return the version string
         return match.group(1)
@@ -306,9 +309,9 @@ def get_hipcc_rocm_version():
 
 def get_neuronxcc_version():
     import sysconfig
+
     site_dir = sysconfig.get_paths()["purelib"]
-    version_file = os.path.join(site_dir, "neuronxcc", "version",
-                                "__init__.py")
+    version_file = os.path.join(site_dir, "neuronxcc", "version", "__init__.py")
 
     # Check if the command was executed successfully
     with open(version_file, "rt") as fp:
@@ -329,8 +332,9 @@ def get_nvcc_cuda_version() -> Version:
     Adapted from https://github.com/NVIDIA/apex/blob/8b7a1ff183741dd8f9b87e7bafd04cfde99cea28/setup.py
     """
     assert CUDA_HOME is not None, "CUDA_HOME is not set"
-    nvcc_output = subprocess.check_output([CUDA_HOME + "/bin/nvcc", "-V"],
-                                          universal_newlines=True)
+    nvcc_output = subprocess.check_output(
+        [CUDA_HOME + "/bin/nvcc", "-V"], universal_newlines=True
+    )
     output = nvcc_output.split()
     release_idx = output.index("release") + 1
     nvcc_cuda_version = parse(output[release_idx].split(",")[0])
@@ -347,47 +351,12 @@ def find_version(filepath: str) -> str:
     Adapted from https://github.com/ray-project/ray/blob/0b190ee1160eeca9796bc091e07eaebf4c85b511/python/setup.py
     """
     with open(filepath) as fp:
-        version_match = re.search(r"^__version__ = ['\"]([^'\"]*)['\"]",
-                                  fp.read(), re.M)
+        version_match = re.search(
+            r"^__version__ = ['\"]([^'\"]*)['\"]", fp.read(), re.M
+        )
         if version_match:
             return version_match.group(1)
         raise RuntimeError("Unable to find version string.")
-
-
-def get_vllm_version() -> str:
-    version = find_version(get_path("vllm", "version.py"))
-
-    if _no_device():
-        version += "+empty"
-    elif _is_cuda():
-        cuda_version = str(get_nvcc_cuda_version())
-        if cuda_version != MAIN_CUDA_VERSION:
-            cuda_version_str = cuda_version.replace(".", "")[:3]
-            version += f"+cu{cuda_version_str}"
-    elif _is_hip():
-        # Get the HIP version
-        hipcc_version = get_hipcc_rocm_version()
-        if hipcc_version != MAIN_CUDA_VERSION:
-            rocm_version_str = hipcc_version.replace(".", "")[:3]
-            version += f"+rocm{rocm_version_str}"
-    elif _is_neuron():
-        # Get the Neuron version
-        neuron_version = str(get_neuronxcc_version())
-        if neuron_version != MAIN_CUDA_VERSION:
-            neuron_version_str = neuron_version.replace(".", "")[:3]
-            version += f"+neuron{neuron_version_str}"
-    elif _is_openvino():
-        version += "+openvino"
-    elif _is_tpu():
-        version += "+tpu"
-    elif _is_cpu():
-        version += "+cpu"
-    elif _is_xpu():
-        version += "+xpu"
-    else:
-        raise RuntimeError("Unknown runtime environment")
-
-    return version
 
 
 def read_readme() -> str:
@@ -420,8 +389,9 @@ def get_requirements() -> List[str]:
         cuda_major, cuda_minor = torch.version.cuda.split(".")
         modified_requirements = []
         for req in requirements:
-            if ("vllm-flash-attn" in req
-                    and not (cuda_major == "12" and cuda_minor == "1")):
+            if "vllm-flash-attn" in req and not (
+                cuda_major == "12" and cuda_minor == "1"
+            ):
                 # vllm-flash-attn is built only for CUDA 12.1.
                 # Skip for other versions.
                 continue
@@ -441,8 +411,8 @@ def get_requirements() -> List[str]:
         requirements = _read_requirements("requirements-xpu.txt")
     else:
         raise ValueError(
-            "Unsupported platform, please use CUDA, ROCm, Neuron, "
-            "OpenVINO, or CPU.")
+            "Unsupported platform, please use CUDA, ROCm, Neuron, " "OpenVINO, or CPU."
+        )
     return requirements
 
 
@@ -457,9 +427,7 @@ if _is_cuda() or _is_hip():
 if _build_custom_ops():
     ext_modules.append(CMakeExtension(name="vllm._C"))
 
-package_data = {
-    "vllm": ["py.typed", "model_executor/layers/fused_moe/configs/*.json"]
-}
+package_data = {"vllm": ["py.typed", "model_executor/layers/fused_moe/configs/*.json"]}
 if envs.VLLM_USE_PRECOMPILED:
     ext_modules = []
     package_data["vllm"].append("*.so")
@@ -469,11 +437,13 @@ if _no_device():
 
 setup(
     name="vllm",
-    version=get_vllm_version(),
+    version=0.1,
     author="vLLM Team",
     license="Apache 2.0",
-    description=("A high-throughput and memory-efficient inference and "
-                 "serving engine for LLMs"),
+    description=(
+        "A high-throughput and memory-efficient inference and "
+        "serving engine for LLMs"
+    ),
     long_description=read_readme(),
     long_description_content_type="text/markdown",
     url="https://github.com/vllm-project/vllm",
@@ -490,8 +460,9 @@ setup(
         "License :: OSI Approved :: Apache Software License",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
-    packages=find_packages(exclude=("benchmarks", "csrc", "docs", "examples",
-                                    "tests*")),
+    packages=find_packages(
+        exclude=("benchmarks", "csrc", "docs", "examples", "tests*")
+    ),
     python_requires=">=3.8",
     install_requires=get_requirements(),
     ext_modules=ext_modules,
