@@ -395,10 +395,12 @@ class DefaultModelLoader(BaseModelLoader):
                     import chop
                     import chop.passes as passes
                     from chop import MaseGraph
+                    from chop.pipelines import AutoPipelineForDistributedInference
 
                     config = GPT2Config.from_pretrained(
                         "/data/huggingface/nice-gpt2-1.5b"
                     )
+                    config.num_hidden_layers = 1
                     custom_model = GPT2LMHeadModel(config)
 
                     mg = MaseGraph(
@@ -411,6 +413,7 @@ class DefaultModelLoader(BaseModelLoader):
                             "intermediate_tensors",
                         ],
                     )
+                    pipeline = AutoPipelineForDistributedInference()
 
                     # Get dummy inputs
                     inputs = {
@@ -432,14 +435,36 @@ class DefaultModelLoader(BaseModelLoader):
                         "intermediate_tensors": torch.randn(10),
                     }
 
-                    mg, _ = passes.init_metadata_analysis_pass(mg)
-                    mg, _ = passes.add_common_metadata_analysis_pass(
+                    mg, _ = pipeline(
                         mg,
                         pass_args={
-                            "dummy_in": inputs,
-                            "add_value": True,
+                            "add_common_metadata_analysis_pass": {
+                                "dummy_in": inputs,
+                                "add_value": True,
+                            },
+                            "autosharding_analysis_pass": {
+                                "algo": "alpa",
+                                "mesh_shape": (2, 4),
+                                "inter_node_bandwidth": 10e9,
+                                "intra_node_bandwidth": 100e9,
+                                "skip_fully_replicated": False,
+                                "time_limit": 10000,
+                                "mip_rel_gap": 0,
+                                "run_checks": False,
+                                "preload_solution": True,
+                                "ilp_solution_file": f"experiments/data-huggingface-nice-gpt2-1-5b_bs_8_seq_len_128_milp_gap_0_num_hidden_layers_1_ilp_solution.pkl",
+                                "benchmarking_device": torch.distributed.get_rank(),
+                            },
+                            "resharding_transform_pass": {
+                                "tensor_sharding_map": "self/autosharding_analysis_pass",  # output of autosharding_analysis_pass is directed to resharding_transform_pass
+                                "device_mesh": [
+                                    [0, 1, 2, 3],
+                                    [4, 5, 6, 7],
+                                ],
+                            },
                         },
                     )
+
                     model = mg.model
                 else:
                     model = _initialize_model(
