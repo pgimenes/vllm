@@ -33,7 +33,9 @@ from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
+    QKVReplicatedLinear,
     RowParallelLinear,
+    ReplicatedLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -46,6 +48,26 @@ from vllm.sequence import IntermediateTensors, SamplerOutput
 from .utils import is_pp_missing_parameter, make_layers
 
 
+def _linear_cls_from_config(config: str):
+    if config == "replicated":
+        return ReplicatedLinear
+    if config == "column":
+        return ColumnParallelLinear
+    if config == "row":
+        return RowParallelLinear
+
+    raise ValueError(f"Unknown linear config: {config}")
+
+
+def _qkv_linear_cls_from_config(config: str):
+    if config == "column":
+        return QKVParallelLinear
+    if config == "replicated":
+        return QKVReplicatedLinear
+
+    raise ValueError(f"Unknown linear config: {config}")
+
+
 class GPT2Attention(nn.Module):
 
     def __init__(
@@ -54,9 +76,10 @@ class GPT2Attention(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        parallelism_config: dict = {},
+        sharding_config: dict = {},
     ):
         super().__init__()
+        self.prefix = prefix
         self.hidden_size = config.hidden_size
         total_num_heads = config.num_attention_heads
         tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
@@ -64,61 +87,64 @@ class GPT2Attention(nn.Module):
         self.num_heads = total_num_heads // tensor_model_parallel_world_size
         self.head_dim = self.hidden_size // total_num_heads
         self.scale = self.head_dim**-0.5
-        self.parallelism_config = parallelism_config
+        self.sharding_config = sharding_config
 
-        c_attn_cls = parallelism_config.get(f"{prefix}.c_attn", None)
-        if c_attn_cls is None or c_attn_cls == QKVParallelLinear:
-            self.c_attn = QKVParallelLinear(
-                hidden_size=self.hidden_size,
-                head_size=self.head_dim,
-                total_num_heads=total_num_heads,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.c_attn",
-            )
-        else:
-            self.c_attn = c_attn_cls(
-                input_size=self.hidden_size,
-                output_size=3 * self.hidden_size,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.c_attn",
-            )
+        # Get sharding types
+        c_attn_type = sharding_config.get(f"{prefix}.c_attn", "column")
+        attn_type = sharding_config.get(f"{prefix}.attn", "column")
+        c_proj_type = sharding_config.get(f"{prefix}.c_proj", "row")
 
-        attn_cls = parallelism_config.get(f"{prefix}.attn", None)
-        attn_common_args = {
+        # c_attn
+        c_attn_args = {
+            "hidden_size": self.hidden_size,
+            "head_size": self.head_dim,
+            "total_num_heads": total_num_heads,
+            "bias": True,
+            "quant_config": quant_config,
+            "prefix": f"{prefix}.c_attn",
+        }
+        if c_attn_type == "column" and attn_type != "column":
+            c_attn_args["gather_output"] = True
+        self.c_attn = _qkv_linear_cls_from_config(c_attn_type)(
+            **c_attn_args,
+        )
+
+        # attn
+        attn_args = {
             "num_heads": self.num_heads,
             "head_size": self.head_dim,
             "scale": self.scale,
             "cache_config": cache_config,
             "quant_config": quant_config,
         }
-        if attn_cls is None:
-            self.attn = Attention(
-                **attn_common_args,
-            )
-        else:
-            self.attn = attn_cls(
-                **attn_common_args,
-            )
 
-        c_proj_cls = parallelism_config.get(f"{prefix}.c_proj", None)
-        if c_proj_cls is not None:
-            self.c_proj = c_proj_cls(
-                input_size=self.hidden_size,
-                output_size=self.hidden_size,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.c_proj",
-            )
-        else:
-            self.c_proj = RowParallelLinear(
-                input_size=self.hidden_size,
-                output_size=self.hidden_size,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.c_proj",
-            )
+        if attn_type == "replicated":
+            attn_args["num_heads"] = total_num_heads
+        if attn_type == "column" and c_attn_type != "column":
+            attn_args["input_is_parallel"] = False
+        if attn_type == "column" and c_proj_type != "row":
+            attn_args["gather_output"] = True
+
+        self.attn = Attention(
+            **attn_args,
+        )
+
+        # c_proj
+        c_proj_args = {
+            "input_size": self.hidden_size,
+            "output_size": self.hidden_size,
+            "bias": True,
+            "quant_config": quant_config,
+            "prefix": f"{prefix}.c_proj",
+        }
+        if c_proj_type == "column":
+            c_proj_args["gather_output"] = True
+        if c_proj_type == "row" and attn_type != "column":
+            c_proj_args["input_is_parallel"] = False
+
+        self.c_proj = _linear_cls_from_config(c_proj_type)(
+            **c_proj_args,
+        )
 
     def forward(
         self,
@@ -142,74 +168,54 @@ class GPT2MLP(nn.Module):
         config: GPT2Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        parallelism_config: dict = {},
+        sharding_config: dict = {},
     ):
         super().__init__()
         hidden_size = config.hidden_size
 
-        c_fc_cls = parallelism_config.get(f"{prefix}.c_fc", None)
-        c_fc_common_args = {
+        # Get sharding types
+        c_fc_type = sharding_config.get(f"{prefix}.c_fc", "column")
+        c_proj_type = sharding_config.get(f"{prefix}.c_proj", "row")
+
+        # c_fc
+        c_fc_args = {
             "input_size": hidden_size,
             "output_size": intermediate_size,
             "bias": True,
             "quant_config": quant_config,
             "prefix": f"{prefix}.c_fc",
         }
-        # Custom parallelism configuration
-        if c_fc_cls is not None:
-            extra_kwargs = {}
 
-            if (
-                c_fc_cls == ColumnParallelLinear
-                # Column parallel will generate RS sharding, and only RowParallelLinear
-                # can accept that
-                and parallelism_config.get(f"{prefix}.c_proj") != RowParallelLinear
-            ):
-                extra_kwargs["gather_output"] = True
-            # Input will never have RS sharding due to LayerNorm
-            elif c_fc_cls == RowParallelLinear:
-                extra_kwargs["input_is_parallel"] = False
+        # Column parallel will generate RS sharding, and only RowParallelLinear
+        # can accept that
+        if c_fc_type == "column" and c_proj_type != "row":
+            c_fc_args["gather_output"] = True
+        # Input will never have RS sharding due to LayerNorm
+        elif c_fc_type == "row":
+            c_fc_args["input_is_parallel"] = False
 
-            self.c_fc = c_fc_cls(
-                **c_fc_common_args,
-                **extra_kwargs,
-            )
-        # Default Megatron-LM parallelism
-        else:
-            self.c_fc = ColumnParallelLinear(
-                **c_fc_common_args,
-            )
+        self.c_fc = _linear_cls_from_config(c_fc_type)(
+            **c_fc_args,
+        )
 
-        c_proj_cls = parallelism_config.get(f"{prefix}.c_proj", None)
-        c_proj_common_args = {
+        # c_proj
+        c_proj_args = {
             "input_size": intermediate_size,
             "output_size": hidden_size,
             "bias": True,
             "quant_config": quant_config,
             "prefix": f"{prefix}.c_proj",
         }
-        # Custom parallelism configuration
-        if c_proj_cls is not None:
-            extra_kwargs = {}
+        # Always need to gather output due to layer norm
+        if c_proj_type == "column":
+            c_proj_args["gather_output"] = True
+        # If previous layer was column parallel, input tensor already has RS sharding
+        elif c_proj_type == "row" and c_fc_type != "column":
+            c_proj_args["input_is_parallel"] = False
 
-            if c_proj_cls == ColumnParallelLinear:
-                extra_kwargs["gather_output"] = True
-            elif (
-                c_proj_cls == RowParallelLinear
-                # If previous layer was column parallel, input tensor already has RS sharding
-                and parallelism_config.get(f"{prefix}.c_fc") != ColumnParallelLinear
-            ):
-                extra_kwargs["input_is_parallel"] = False
-
-            self.c_proj = c_proj_cls(
-                **c_proj_common_args,
-                **extra_kwargs,
-            )
-        # Default Megatron-LM parallelism
-        else:
-            self.c_proj = RowParallelLinear(
-                **c_proj_common_args,
-            )
+        self.c_proj = _linear_cls_from_config(c_proj_type)(
+            **c_proj_args,
+        )
 
         self.act = get_act_fn(
             config.activation_function,
@@ -220,10 +226,7 @@ class GPT2MLP(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         h0, _ = self.c_fc(hidden_states)
         h1 = self.act(h0)
-        try:
-            h2, _ = self.c_proj(h1)
-        except:
-            torch.distributed.breakpoint(0)
+        h2, _ = self.c_proj(h1)
         return h2
 
 
@@ -235,7 +238,7 @@ class GPT2Block(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        parallelism_config: dict = {},
+        sharding_config: dict = {},
     ):
         super().__init__()
         hidden_size = config.hidden_size
@@ -247,7 +250,7 @@ class GPT2Block(nn.Module):
             cache_config,
             quant_config,
             prefix=f"{prefix}.attn",
-            parallelism_config=parallelism_config,
+            sharding_config=sharding_config,
         )
         self.ln_2 = nn.LayerNorm(
             hidden_size,
@@ -258,7 +261,7 @@ class GPT2Block(nn.Module):
             config,
             quant_config,
             prefix=f"{prefix}.mlp",
-            parallelism_config=parallelism_config,
+            sharding_config=sharding_config,
         )
 
     def forward(
@@ -293,7 +296,7 @@ class GPT2Model(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        parallelism_config: dict = {},
+        sharding_config: dict = {},
     ):
         super().__init__()
         self.config = config
@@ -310,7 +313,7 @@ class GPT2Model(nn.Module):
                 cache_config,
                 quant_config,
                 prefix=prefix,
-                parallelism_config=parallelism_config,
+                sharding_config=sharding_config,
             ),
             prefix=f"{prefix}.h",
         )
@@ -352,7 +355,7 @@ class GPT2LMHeadModel(nn.Module):
         config: GPT2Config,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        parallelism_config: dict = {},
+        sharding_config: dict = {},
     ):
         super().__init__()
         self.config = config
@@ -362,7 +365,7 @@ class GPT2LMHeadModel(nn.Module):
             cache_config,
             quant_config,
             prefix="transformer",
-            parallelism_config=parallelism_config,
+            sharding_config=sharding_config,
         )
         self.lm_head = self.transformer.wte
         self.logits_processor = LogitsProcessor(config.vocab_size)

@@ -712,7 +712,6 @@ class QKVReplicatedLinear(ReplicatedLinear):
             input_size=input_size,
             output_size=output_size,
             bias=bias,
-            gather_output=False,
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
             quant_config=quant_config,
@@ -757,6 +756,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        gather_output: bool = False,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -787,11 +787,11 @@ class QKVParallelLinear(ColumnParallelLinear):
             input_size=input_size,
             output_size=output_size,
             bias=bias,
-            gather_output=False,
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
             quant_config=quant_config,
             prefix=prefix,
+            gather_output=gather_output,
         )
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
@@ -1198,3 +1198,73 @@ class RowParallelLinear(LinearBase):
         s += f", tp_size={self.tp_size}"
         s += f", reduce_results={self.reduce_results}"
         return s
+
+
+class QKVRowParallelLinear(RowParallelLinear):
+    """
+    Args:
+        hidden_size: input hidden state size of the transformer.
+        head_size: size of each attention head.
+        total_num_heads: total number of attention query heads.
+        total_num_kv_heads: total number of attention key/value heads. If
+                            None, assume total_num_kv_heads = total_num_heads.
+        bias: If true, add bias.
+        skip_bias_add: This was added to enable performance optimizations where
+                       bias can be fused with other element-wise operations. we
+                       skip adding bias but instead return it.
+        params_dtype: Data type for the parameters.
+        quant_config: Quantization configure.
+        prefix: The name of the layer in the state dict, including all parents
+                        (e.g. model.layers.0.qkv_proj)
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: Optional[int] = None,
+        bias: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        input_is_parallel: bool = False,
+        reduce_results: bool = True,
+    ):
+        self.hidden_size = hidden_size
+        self.head_size = head_size
+        self.total_num_heads = total_num_heads
+        if total_num_kv_heads is None:
+            total_num_kv_heads = total_num_heads
+        self.total_num_kv_heads = total_num_kv_heads
+        # Divide the weight matrix along the last dimension.
+        tp_size = get_tensor_model_parallel_world_size()
+        self.num_heads = divide(self.total_num_heads, tp_size)
+        if tp_size >= self.total_num_kv_heads:
+            self.num_kv_heads = 1
+            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+        else:
+            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+            self.num_kv_head_replicas = 1
+        input_size = self.hidden_size
+        output_size = (
+            (self.num_heads + 2 * self.num_kv_heads) * tp_size * self.head_size
+        )
+        self.output_sizes = [
+            self.num_heads * self.head_size * tp_size,  # q_proj
+            self.num_kv_heads * self.head_size * tp_size,  # k_proj
+            self.num_kv_heads * self.head_size * tp_size,  # v_proj
+        ]
+
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=prefix,
+            input_is_parallel=input_is_parallel,
+            reduce_results=reduce_results,
+        )

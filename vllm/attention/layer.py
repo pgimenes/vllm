@@ -11,6 +11,13 @@ from vllm.config import CacheConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    split_tensor_along_last_dim,
+    tensor_model_parallel_all_gather,
+)
+
 
 class Attention(nn.Module):
     """Attention layer.
@@ -36,6 +43,8 @@ class Attention(nn.Module):
         blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
         prefix: str = "",
+        input_is_parallel: bool = True,
+        gather_output: bool = False,
     ) -> None:
         super().__init__()
         if cache_config is not None:
@@ -101,6 +110,11 @@ class Attention(nn.Module):
             logits_soft_cap,
         )
 
+        self.input_is_parallel = input_is_parallel
+        self.gather_output = gather_output
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
+
     def forward(
         self,
         query: torch.Tensor,
@@ -111,16 +125,45 @@ class Attention(nn.Module):
         attn_type: AttentionType = AttentionType.DECODER,
     ) -> torch.Tensor:
 
-        return self.impl.forward(
-            query,
-            key,
-            value,
+        if self.input_is_parallel:
+            parallel_query = query
+            parallel_key = key
+            parallel_value = value
+
+        else:
+            splitted_query = split_tensor_along_last_dim(
+                query,
+                num_partitions=self.tp_size,
+            )
+            parallel_query = splitted_query[self.tp_rank].contiguous()
+
+            splitted_key = split_tensor_along_last_dim(
+                key,
+                num_partitions=self.tp_size,
+            )
+            parallel_key = splitted_key[self.tp_rank].contiguous()
+
+            splitted_value = split_tensor_along_last_dim(
+                value,
+                num_partitions=self.tp_size,
+            )
+            parallel_value = splitted_value[self.tp_rank].contiguous()
+
+        attn_out = self.impl.forward(
+            parallel_query,
+            parallel_key,
+            parallel_value,
             kv_cache,
             attn_metadata,
             self._k_scale,
             self._v_scale,
             attn_type=attn_type,
         )
+
+        if self.gather_output:
+            attn_out = tensor_model_parallel_all_gather(attn_out)
+
+        return attn_out
 
     def extra_repr(self) -> str:
         s = f"head_size={self.impl.head_size}"  # type: ignore

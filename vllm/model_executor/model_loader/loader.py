@@ -65,14 +65,6 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import is_pin_memory_available
 
-from vllm.model_executor.layers.linear import (
-    RowParallelLinear,
-    ColumnParallelLinear,
-    QKVParallelLinear,
-    QKVReplicatedLinear,
-    ReplicatedLinear,
-)
-
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
@@ -186,6 +178,7 @@ def build_model(
     lora_config: Optional[LoRAConfig],
     multimodal_config: Optional[MultiModalConfig],
     scheduler_config: Optional[SchedulerConfig],
+    parallel_config: Optional[ParallelConfig] = None,
 ) -> nn.Module:
     extra_kwargs = _get_model_initialization_kwargs(
         model_class,
@@ -194,18 +187,11 @@ def build_model(
         scheduler_config,
     )
 
-    parallelism_config = {}
-    for layer in range(hf_config.num_hidden_layers):
-        # parallelism_config[f"transformer.h.{layer}.attn.c_attn"] = ReplicatedLinear
-        # parallelism_config[f"transformer.h.{layer}.attn.c_proj"] = ReplicatedLinear
-        parallelism_config[f"transformer.h.{layer}.mlp.c_fc"] = ColumnParallelLinear
-        parallelism_config[f"transformer.h.{layer}.mlp.c_proj"] = RowParallelLinear
-
     model = model_class(
         config=hf_config,
         cache_config=cache_config,
         quant_config=quant_config,
-        parallelism_config=parallelism_config,
+        sharding_config=parallel_config.sharding_config,
         **extra_kwargs,
     )
 
@@ -218,6 +204,7 @@ def _initialize_model(
     lora_config: Optional[LoRAConfig],
     cache_config: CacheConfig,
     scheduler_config: Optional[SchedulerConfig] = None,
+    parallel_config: ParallelConfig = None,
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
@@ -230,6 +217,7 @@ def _initialize_model(
         lora_config=lora_config,
         multimodal_config=model_config.multimodal_config,
         scheduler_config=scheduler_config,
+        parallel_config=parallel_config,
     )
 
 
@@ -489,11 +477,12 @@ class DefaultModelLoader(BaseModelLoader):
                     model = mg.model
                 else:
                     model = _initialize_model(
-                        model_config,
-                        self.load_config,
-                        lora_config,
-                        cache_config,
-                        scheduler_config,
+                        model_config=model_config,
+                        load_config=self.load_config,
+                        lora_config=lora_config,
+                        cache_config=cache_config,
+                        scheduler_config=scheduler_config,
+                        parallel_config=parallel_config,
                     )
 
                 if not os.environ.get("MASE_VLLM"):
