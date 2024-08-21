@@ -26,17 +26,19 @@ from transformers import GPT2Config
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig
 from vllm.distributed.parallel_state import (
-    get_pp_group, get_tensor_model_parallel_world_size)
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.model_executor.layers.activation import get_act_fn
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               QKVParallelLinear,
-                                               RowParallelLinear)
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.sampler import Sampler
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding)
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors, SamplerOutput
@@ -52,37 +54,71 @@ class GPT2Attention(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        parallelism_config: dict = {},
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
         total_num_heads = config.num_attention_heads
-        tensor_model_parallel_world_size = (
-            get_tensor_model_parallel_world_size())
+        tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
         assert total_num_heads % tensor_model_parallel_world_size == 0
         self.num_heads = total_num_heads // tensor_model_parallel_world_size
         self.head_dim = self.hidden_size // total_num_heads
         self.scale = self.head_dim**-0.5
+        self.parallelism_config = parallelism_config
 
-        self.c_attn = QKVParallelLinear(
-            self.hidden_size,
-            self.head_dim,
-            total_num_heads,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.c_attn",
-        )
-        self.c_proj = RowParallelLinear(
-            self.hidden_size,
-            self.hidden_size,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.c_proj",
-        )
-        self.attn = Attention(self.num_heads,
-                              self.head_dim,
-                              scale=self.scale,
-                              cache_config=cache_config,
-                              quant_config=quant_config)
+        c_attn_cls = parallelism_config.get(f"{prefix}.c_attn", None)
+        if c_attn_cls is None or c_attn_cls == QKVParallelLinear:
+            self.c_attn = QKVParallelLinear(
+                hidden_size=self.hidden_size,
+                head_size=self.head_dim,
+                total_num_heads=total_num_heads,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.c_attn",
+            )
+        else:
+            self.c_attn = c_attn_cls(
+                input_size=self.hidden_size,
+                output_size=3 * self.hidden_size,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.c_attn",
+            )
+
+        attn_cls = parallelism_config.get(f"{prefix}.attn", None)
+        attn_common_args = {
+            "num_heads": self.num_heads,
+            "head_size": self.head_dim,
+            "scale": self.scale,
+            "cache_config": cache_config,
+            "quant_config": quant_config,
+        }
+        if attn_cls is None:
+            self.attn = Attention(
+                **attn_common_args,
+            )
+        else:
+            self.attn = attn_cls(
+                **attn_common_args,
+            )
+
+        c_proj_cls = parallelism_config.get(f"{prefix}.c_proj", None)
+        if c_proj_cls is not None:
+            self.c_proj = c_proj_cls(
+                input_size=self.hidden_size,
+                output_size=self.hidden_size,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.c_proj",
+            )
+        else:
+            self.c_proj = RowParallelLinear(
+                input_size=self.hidden_size,
+                output_size=self.hidden_size,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.c_proj",
+            )
 
     def forward(
         self,
@@ -94,6 +130,7 @@ class GPT2Attention(nn.Module):
         q, k, v = qkv.chunk(chunks=3, dim=-1)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         attn_output, _ = self.c_proj(attn_output)
+
         return attn_output
 
 
@@ -105,31 +142,89 @@ class GPT2MLP(nn.Module):
         config: GPT2Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        parallelism_config: dict = {},
     ):
         super().__init__()
         hidden_size = config.hidden_size
-        self.c_fc = ColumnParallelLinear(
-            hidden_size,
+
+        c_fc_cls = parallelism_config.get(f"{prefix}.c_fc", None)
+        c_fc_common_args = {
+            "input_size": hidden_size,
+            "output_size": intermediate_size,
+            "bias": True,
+            "quant_config": quant_config,
+            "prefix": f"{prefix}.c_fc",
+        }
+        # Custom parallelism configuration
+        if c_fc_cls is not None:
+            extra_kwargs = {}
+
+            if (
+                c_fc_cls == ColumnParallelLinear
+                # Column parallel will generate RS sharding, and only RowParallelLinear
+                # can accept that
+                and parallelism_config.get(f"{prefix}.c_proj") != RowParallelLinear
+            ):
+                extra_kwargs["gather_output"] = True
+            # Input will never have RS sharding due to LayerNorm
+            elif c_fc_cls == RowParallelLinear:
+                extra_kwargs["input_is_parallel"] = False
+
+            self.c_fc = c_fc_cls(
+                **c_fc_common_args,
+                **extra_kwargs,
+            )
+        # Default Megatron-LM parallelism
+        else:
+            self.c_fc = ColumnParallelLinear(
+                **c_fc_common_args,
+            )
+
+        c_proj_cls = parallelism_config.get(f"{prefix}.c_proj", None)
+        c_proj_common_args = {
+            "input_size": intermediate_size,
+            "output_size": hidden_size,
+            "bias": True,
+            "quant_config": quant_config,
+            "prefix": f"{prefix}.c_proj",
+        }
+        # Custom parallelism configuration
+        if c_proj_cls is not None:
+            extra_kwargs = {}
+
+            if c_proj_cls == ColumnParallelLinear:
+                extra_kwargs["gather_output"] = True
+            elif (
+                c_proj_cls == RowParallelLinear
+                # If previous layer was column parallel, input tensor already has RS sharding
+                and parallelism_config.get(f"{prefix}.c_fc") != ColumnParallelLinear
+            ):
+                extra_kwargs["input_is_parallel"] = False
+
+            self.c_proj = c_proj_cls(
+                **c_proj_common_args,
+                **extra_kwargs,
+            )
+        # Default Megatron-LM parallelism
+        else:
+            self.c_proj = RowParallelLinear(
+                **c_proj_common_args,
+            )
+
+        self.act = get_act_fn(
+            config.activation_function,
+            quant_config,
             intermediate_size,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.c_fc",
         )
-        self.c_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.c_proj",
-        )
-        self.act = get_act_fn(config.activation_function, quant_config,
-                              intermediate_size)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states, _ = self.c_fc(hidden_states)
-        hidden_states = self.act(hidden_states)
-        hidden_states, _ = self.c_proj(hidden_states)
-        return hidden_states
+        h0, _ = self.c_fc(hidden_states)
+        h1 = self.act(h0)
+        try:
+            h2, _ = self.c_proj(h1)
+        except:
+            torch.distributed.breakpoint(0)
+        return h2
 
 
 class GPT2Block(nn.Module):
@@ -140,22 +235,31 @@ class GPT2Block(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        parallelism_config: dict = {},
     ):
         super().__init__()
         hidden_size = config.hidden_size
-        inner_dim = (config.n_inner if config.n_inner is not None else 4 *
-                     hidden_size)
+        inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.attn = GPT2Attention(config,
-                                  cache_config,
-                                  quant_config,
-                                  prefix=f"{prefix}.attn")
-        self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.mlp = GPT2MLP(inner_dim,
-                           config,
-                           quant_config,
-                           prefix=f"{prefix}.mlp")
+        self.attn = GPT2Attention(
+            config,
+            cache_config,
+            quant_config,
+            prefix=f"{prefix}.attn",
+            parallelism_config=parallelism_config,
+        )
+        self.ln_2 = nn.LayerNorm(
+            hidden_size,
+            eps=config.layer_norm_epsilon,
+        )
+        self.mlp = GPT2MLP(
+            inner_dim,
+            config,
+            quant_config,
+            prefix=f"{prefix}.mlp",
+            parallelism_config=parallelism_config,
+        )
 
     def forward(
         self,
@@ -189,6 +293,7 @@ class GPT2Model(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        parallelism_config: dict = {},
     ):
         super().__init__()
         self.config = config
@@ -201,8 +306,14 @@ class GPT2Model(nn.Module):
         self.start_layer, self.end_layer, self.h = make_layers(
             config.num_hidden_layers,
             lambda prefix: GPT2Block(
-                config, cache_config, quant_config, prefix=prefix),
-            prefix=f"{prefix}.h")
+                config,
+                cache_config,
+                quant_config,
+                prefix=prefix,
+                parallelism_config=parallelism_config,
+            ),
+            prefix=f"{prefix}.h",
+        )
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
     def forward(
@@ -223,9 +334,9 @@ class GPT2Model(nn.Module):
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.h[i]
-            hidden_states = layer(hidden_states,
-                                  kv_caches[i - self.start_layer],
-                                  attn_metadata)
+            hidden_states = layer(
+                hidden_states, kv_caches[i - self.start_layer], attn_metadata
+            )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
@@ -241,14 +352,18 @@ class GPT2LMHeadModel(nn.Module):
         config: GPT2Config,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        parallelism_config: dict = {},
     ):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.transformer = GPT2Model(config,
-                                     cache_config,
-                                     quant_config,
-                                     prefix="transformer")
+        self.transformer = GPT2Model(
+            config,
+            cache_config,
+            quant_config,
+            prefix="transformer",
+            parallelism_config=parallelism_config,
+        )
         self.lm_head = self.transformer.wte
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = Sampler()
@@ -261,8 +376,9 @@ class GPT2LMHeadModel(nn.Module):
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.transformer(input_ids, positions, kv_caches,
-                                         attn_metadata, intermediate_tensors)
+        hidden_states = self.transformer(
+            input_ids, positions, kv_caches, attn_metadata, intermediate_tensors
+        )
         return hidden_states
 
     def compute_logits(
@@ -270,8 +386,7 @@ class GPT2LMHeadModel(nn.Module):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata)
+        logits = self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
         return logits
 
     def sample(
@@ -283,14 +398,15 @@ class GPT2LMHeadModel(nn.Module):
         return next_tokens
 
     def make_empty_intermediate_tensors(
-            self, batch_size: int, dtype: torch.dtype,
-            device: torch.device) -> IntermediateTensors:
-        return IntermediateTensors({
-            "hidden_states":
-            torch.zeros((batch_size, self.config.hidden_size),
-                        dtype=dtype,
-                        device=device),
-        })
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
+                ),
+            }
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
@@ -319,6 +435,5 @@ class GPT2LMHeadModel(nn.Module):
                 if not name.endswith(".weight"):
                     continue
                 loaded_weight = loaded_weight.t()
-            weight_loader = getattr(param, "weight_loader",
-                                    default_weight_loader)
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)

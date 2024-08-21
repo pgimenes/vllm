@@ -966,6 +966,9 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         if os.environ.get("MASE_VLLM"):
             self.logits_processor = LogitsProcessor(self.model_config.get_vocab_size())
             self.sampler = Sampler()
+            self.MASE_VLLM = True
+        else:
+            self.MASE_VLLM = False
 
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
@@ -1051,7 +1054,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
             self.model = torch.compile(self.model, fullgraph=True, backend="eager")
 
         # Define LM head - must be executed after the model parallel group is initialized
-        if os.environ.get("MASE_VLLM"):
+        if self.MASE_VLLM:
             target_device = torch.device(self.device_config.device)
             with target_device:
                 self.lm_head = VocabParallelEmbedding(
@@ -1675,7 +1678,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_end = torch.cuda.Event(enable_timing=True)
             model_forward_start.record()
 
-        if os.environ.get("MASE_VLLM"):
+        if self.MASE_VLLM:
             hidden_or_intermediate_states = model_executable(
                 input_ids=model_input.input_tokens,
                 position_ids=model_input.input_positions,
@@ -1723,7 +1726,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 )
             return hidden_or_intermediate_states
 
-        if os.environ.get("MASE_VLLM"):
+        if self.MASE_VLLM:
             logits = self.logits_processor(
                 self.lm_head,
                 hidden_or_intermediate_states.squeeze(),
@@ -1739,7 +1742,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             return []
 
         # Sample the next token.
-        if os.environ.get("MASE_VLLM"):
+        if self.MASE_VLLM:
             output: SamplerOutput = self.sampler(
                 logits=logits,
                 sampling_metadata=model_input.sampling_metadata,

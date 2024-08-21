@@ -65,6 +65,14 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import is_pin_memory_available
 
+from vllm.model_executor.layers.linear import (
+    RowParallelLinear,
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    QKVReplicatedLinear,
+    ReplicatedLinear,
+)
+
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
@@ -180,15 +188,28 @@ def build_model(
     scheduler_config: Optional[SchedulerConfig],
 ) -> nn.Module:
     extra_kwargs = _get_model_initialization_kwargs(
-        model_class, lora_config, multimodal_config, scheduler_config
+        model_class,
+        lora_config,
+        multimodal_config,
+        scheduler_config,
     )
 
-    return model_class(
+    parallelism_config = {}
+    for layer in range(hf_config.num_hidden_layers):
+        # parallelism_config[f"transformer.h.{layer}.attn.c_attn"] = ReplicatedLinear
+        # parallelism_config[f"transformer.h.{layer}.attn.c_proj"] = ReplicatedLinear
+        parallelism_config[f"transformer.h.{layer}.mlp.c_fc"] = ColumnParallelLinear
+        parallelism_config[f"transformer.h.{layer}.mlp.c_proj"] = RowParallelLinear
+
+    model = model_class(
         config=hf_config,
         cache_config=cache_config,
         quant_config=quant_config,
+        parallelism_config=parallelism_config,
         **extra_kwargs,
     )
+
+    return model
 
 
 def _initialize_model(
