@@ -33,6 +33,7 @@ from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
+    QKVRowParallelLinear,
     QKVReplicatedLinear,
     RowParallelLinear,
     ReplicatedLinear,
@@ -62,6 +63,8 @@ def _linear_cls_from_config(config: str):
 def _qkv_linear_cls_from_config(config: str):
     if config == "column":
         return QKVParallelLinear
+    if config == "row":
+        return QKVRowParallelLinear
     if config == "replicated":
         return QKVReplicatedLinear
 
@@ -105,6 +108,8 @@ class GPT2Attention(nn.Module):
         }
         if c_attn_type == "column" and attn_type != "column":
             c_attn_args["gather_output"] = True
+        if c_attn_type == "row":
+            c_attn_args["input_is_parallel"] = False
         self.c_attn = _qkv_linear_cls_from_config(c_attn_type)(
             **c_attn_args,
         )

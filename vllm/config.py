@@ -1,7 +1,17 @@
 import enum
 import json
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, ClassVar, List, Mapping, Optional, Tuple, Type, Union
+from typing import (
+    TYPE_CHECKING,
+    ClassVar,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+    Dict,
+)
 
 import torch
 from transformers import PretrainedConfig
@@ -816,6 +826,7 @@ class ParallelConfig:
         ray_workers_use_nsight: bool = False,
         placement_group: Optional["PlacementGroup"] = None,
         distributed_executor_backend: Optional[Union[str, Type["ExecutorBase"]]] = None,
+        sharding_config: Optional[Dict[str, str]] = None,
     ) -> None:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
@@ -871,20 +882,7 @@ class ParallelConfig:
         self._verify_args()
         self.rank: int = 0
 
-        self.sharding_config = {}
-        for layer in range(48):
-            # self.sharding_config[layer] = {
-            #     "attn.c_attn": QKVReplicatedLinear,
-            #     "attn.attn": "replicated",
-            #     "attn.c_proj": ReplicatedLinear,
-            #     "mlp.c_fc": ColumnParallelLinear,
-            #     "mlp.c_proj": RowParallelLinear,
-            # }
-            self.sharding_config[f"transformer.h.{layer}.attn.c_attn"] = "column"
-            self.sharding_config[f"transformer.h.{layer}.attn.attn"] = "column"
-            self.sharding_config[f"transformer.h.{layer}.attn.c_proj"] = "row"
-            self.sharding_config[f"transformer.h.{layer}.mlp.c_fc"] = "column"
-            self.sharding_config[f"transformer.h.{layer}.mlp.c_proj"] = "row"
+        self.sharding_config = sharding_config
 
     @property
     def use_ray(self) -> bool:

@@ -1238,23 +1238,18 @@ class QKVRowParallelLinear(RowParallelLinear):
         if total_num_kv_heads is None:
             total_num_kv_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
-        # Divide the weight matrix along the last dimension.
-        tp_size = get_tensor_model_parallel_world_size()
-        self.num_heads = divide(self.total_num_heads, tp_size)
-        if tp_size >= self.total_num_kv_heads:
-            self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
-        else:
-            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
-            self.num_kv_head_replicas = 1
+
+        # Fully replicated, so num_* = total_num_*
+        self.num_heads = self.total_num_heads
+        self.num_kv_heads = self.total_num_kv_heads
+        self.num_kv_head_replicas = 1
+
         input_size = self.hidden_size
-        output_size = (
-            (self.num_heads + 2 * self.num_kv_heads) * tp_size * self.head_size
-        )
+        output_size = (self.num_heads + 2 * self.num_kv_heads) * self.head_size
         self.output_sizes = [
-            self.num_heads * self.head_size * tp_size,  # q_proj
-            self.num_kv_heads * self.head_size * tp_size,  # k_proj
-            self.num_kv_heads * self.head_size * tp_size,  # v_proj
+            self.num_heads * self.head_size,  # q_proj
+            self.num_kv_heads * self.head_size,  # k_proj
+            self.num_kv_heads * self.head_size,  # v_proj
         ]
 
         super().__init__(

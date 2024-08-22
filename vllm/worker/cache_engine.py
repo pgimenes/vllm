@@ -38,7 +38,7 @@ class CacheEngine:
         self.num_attention_layers = model_config.get_num_attention_layers(
             parallel_config
         )
-        self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+        self.num_kv_heads = self.model_config.get_total_num_kv_heads()
 
         self.block_size = cache_config.block_size
         self.num_gpu_blocks = cache_config.num_gpu_blocks
@@ -80,16 +80,12 @@ class CacheEngine:
         kv_cache: List[torch.Tensor] = []
         for layer in range(self.num_attention_layers):
 
-            num_kv_heads = (
-                # If the attention layer is replicated, take the global number of heads
-                self.model_config.get_num_attention_heads(self.parallel_config)
-                if self.parallel_config.sharding_config[
-                    f"transformer.h.{layer}.attn.attn"
-                ]
-                == "replicated"
-                # Otherwise, take the number of heads divided by tensor parallel size
-                else self.num_kv_heads
-            )
+            num_kv_heads = self.num_kv_heads
+            if (
+                self.parallel_config.sharding_config[f"transformer.h.{layer}.attn.attn"]
+                != "replicated"
+            ):
+                num_kv_heads //= self.parallel_config.tensor_parallel_size
 
             kv_cache_shape = self.attn_backend.get_kv_cache_shape(
                 num_blocks,
@@ -133,12 +129,22 @@ class CacheEngine:
         parallel_config: ParallelConfig,
     ) -> int:
         head_size = model_config.get_head_size()
-        num_heads = model_config.get_num_kv_heads(parallel_config)
         num_attention_layers = model_config.get_num_attention_layers(parallel_config)
 
-        key_cache_block = cache_config.block_size * num_heads * head_size
-        value_cache_block = key_cache_block
-        total = num_attention_layers * (key_cache_block + value_cache_block)
+        total = 0
+        for layer in range(num_attention_layers):
+            if (
+                parallel_config.sharding_config[f"transformer.h.{layer}.attn.attn"]
+                == "replicated"
+            ):
+                num_heads = model_config.get_total_num_kv_heads()
+            else:
+                num_heads = model_config.get_num_kv_heads(parallel_config)
+
+            key_cache_block = cache_config.block_size * num_heads * head_size
+            value_cache_block = key_cache_block
+            total += key_cache_block + value_cache_block
+
         if cache_config.cache_dtype == "auto":
             dtype = model_config.dtype
         else:
