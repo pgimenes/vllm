@@ -66,17 +66,15 @@ class Attention(nn.Module):
         self.kv_cache_dtype = kv_cache_dtype
         self._k_scale = 1.0
         self._v_scale = 1.0
-        quant_method = (
-            quant_config.get_quant_method(self, prefix=prefix) if quant_config else None
-        )
+        quant_method = (quant_config.get_quant_method(self, prefix=prefix)
+                        if quant_config else None)
         if quant_method is not None:
             assert isinstance(quant_method, BaseKVCacheMethod)
             # TODO (mgoin): kv cache dtype should be specified in the FP8
             # checkpoint config and become the "auto" behavior
             if self.kv_cache_dtype == "fp8_e5m2":
-                raise ValueError(
-                    "fp8_e5m2 kv-cache is not supported with " "fp8 checkpoints."
-                )
+                raise ValueError("fp8_e5m2 kv-cache is not supported with "
+                                 "fp8 checkpoints.")
             # If quantization is enabled, we make "k_scale" and "v_scale"
             # parameters so that it can be loaded from the model checkpoint.
             # The k/v_scale will then be converted back to native float32
