@@ -36,8 +36,7 @@ class CacheEngine:
         self.head_size = model_config.get_head_size()
         # Models like Jamba, have mixed typed layers, E.g Mamba
         self.num_attention_layers = model_config.get_num_attention_layers(
-            parallel_config
-        )
+            parallel_config)
         self.num_kv_heads = self.model_config.get_total_num_kv_heads()
 
         self.block_size = cache_config.block_size
@@ -66,8 +65,7 @@ class CacheEngine:
 
         # Initialize the cache.
         self.gpu_cache = self._allocate_kv_cache(
-            self.num_gpu_blocks, self.device_config.device_type
-        )
+            self.num_gpu_blocks, self.device_config.device_type)
         self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
 
     def _allocate_kv_cache(
@@ -81,10 +79,9 @@ class CacheEngine:
         for layer in range(self.num_attention_layers):
 
             num_kv_heads = self.num_kv_heads
-            if (
-                self.parallel_config.sharding_config[f"transformer.h.{layer}.attn.attn"]
-                != "replicated"
-            ):
+            if (self.parallel_config.
+                    sharding_config[f"transformer.h.{layer}.attn.attn"] !=
+                    "replicated"):
                 num_kv_heads //= self.parallel_config.tensor_parallel_size
 
             kv_cache_shape = self.attn_backend.get_kv_cache_shape(
@@ -103,21 +100,18 @@ class CacheEngine:
                     dtype=self.dtype,
                     pin_memory=pin_memory,
                     device=device,
-                )
-            )
+                ))
         return kv_cache
 
     def swap_in(self, src_to_dst: torch.Tensor) -> None:
         for i in range(self.num_attention_layers):
-            self.attn_backend.swap_blocks(
-                self.cpu_cache[i], self.gpu_cache[i], src_to_dst
-            )
+            self.attn_backend.swap_blocks(self.cpu_cache[i], self.gpu_cache[i],
+                                          src_to_dst)
 
     def swap_out(self, src_to_dst: torch.Tensor) -> None:
         for i in range(self.num_attention_layers):
-            self.attn_backend.swap_blocks(
-                self.gpu_cache[i], self.cpu_cache[i], src_to_dst
-            )
+            self.attn_backend.swap_blocks(self.gpu_cache[i], self.cpu_cache[i],
+                                          src_to_dst)
 
     def copy(self, src_to_dsts: torch.Tensor) -> None:
         self.attn_backend.copy_blocks(self.gpu_cache, src_to_dsts)
@@ -129,14 +123,13 @@ class CacheEngine:
         parallel_config: ParallelConfig,
     ) -> int:
         head_size = model_config.get_head_size()
-        num_attention_layers = model_config.get_num_attention_layers(parallel_config)
+        num_attention_layers = model_config.get_num_attention_layers(
+            parallel_config)
 
         total = 0
         for layer in range(num_attention_layers):
-            if (
-                parallel_config.sharding_config[f"transformer.h.{layer}.attn.attn"]
-                == "replicated"
-            ):
+            if (parallel_config.sharding_config[
+                    f"transformer.h.{layer}.attn.attn"] == "replicated"):
                 num_heads = model_config.get_total_num_kv_heads()
             else:
                 num_heads = model_config.get_num_kv_heads(parallel_config)
