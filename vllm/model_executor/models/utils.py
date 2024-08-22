@@ -5,7 +5,8 @@ import torch.nn as nn
 from torch.func import functional_call
 from transformers import PretrainedConfig
 
-from vllm.config import CacheConfig, LoRAConfig, MultiModalConfig, SchedulerConfig
+from vllm.config import (CacheConfig, LoRAConfig, MultiModalConfig,
+                         SchedulerConfig)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.loader import build_model
 from vllm.model_executor.models import ModelRegistry
@@ -53,12 +54,10 @@ def init_vllm_registered_model(
     )
 
 
-def merge_multimodal_embeddings(
-    input_ids: torch.Tensor,
-    inputs_embeds: torch.Tensor,
-    multimodal_embeddings: BatchedTensors,
-    placeholder_token_id: int,
-) -> torch.Tensor:
+def merge_multimodal_embeddings(input_ids: torch.Tensor,
+                                inputs_embeds: torch.Tensor,
+                                multimodal_embeddings: BatchedTensors,
+                                placeholder_token_id: int) -> torch.Tensor:
     """
     Merge ``multimodal_embeddings`` into ``inputs_embeds`` by overwriting the
     positions in ``inputs_embeds`` corresponding to placeholder tokens in
@@ -67,7 +66,7 @@ def merge_multimodal_embeddings(
     Note:
         This updates ``inputs_embeds`` in place.
     """
-    mask = input_ids == placeholder_token_id
+    mask = (input_ids == placeholder_token_id)
     num_expected_tokens = mask.sum()
 
     if isinstance(multimodal_embeddings, torch.Tensor):
@@ -77,19 +76,18 @@ def merge_multimodal_embeddings(
             expr = f"{batch_size} x {batch_tokens}"
             raise ValueError(
                 f"Attempted to assign {expr} = {total_tokens} "
-                f"multimodal tokens to {num_expected_tokens} placeholders"
-            )
+                f"multimodal tokens to {num_expected_tokens} placeholders")
 
-        inputs_embeds[mask] = multimodal_embeddings.view(total_tokens, embed_dim)
+        inputs_embeds[mask] = multimodal_embeddings.view(
+            total_tokens, embed_dim)
     else:
         size_per_batch = [t.shape[0] for t in multimodal_embeddings]
         total_tokens = sum(size_per_batch)
         if num_expected_tokens != total_tokens:
-            expr = " + ".join(map(str, size_per_batch))
+            expr = ' + '.join(map(str, size_per_batch))
             raise ValueError(
                 f"Attempted to assign {expr} = {total_tokens} "
-                f"multimodal tokens to {num_expected_tokens} placeholders"
-            )
+                f"multimodal tokens to {num_expected_tokens} placeholders")
 
         inputs_embeds[mask] = torch.cat(multimodal_embeddings)
 
@@ -101,7 +99,8 @@ class LayerFn(Protocol):
     def __call__(
         self,
         prefix="",
-    ) -> torch.nn.Module: ...
+    ) -> torch.nn.Module:
+        ...
 
 
 class PPMissingLayer(torch.nn.Identity):
@@ -145,14 +144,12 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
             break
 
         # `torch.empty_like` does not support `pin_memory` argument
-        cpu_data = torch.empty_strided(
-            size=p.data.size(),
-            stride=p.data.stride(),
-            dtype=p.data.dtype,
-            layout=p.data.layout,
-            device="cpu",
-            pin_memory=pin_memory,
-        )
+        cpu_data = torch.empty_strided(size=p.data.size(),
+                                       stride=p.data.stride(),
+                                       dtype=p.data.dtype,
+                                       layout=p.data.layout,
+                                       device='cpu',
+                                       pin_memory=pin_memory)
         cpu_data.copy_(p.data)
         p.data = cpu_data
         _CPU_OFFLOAD_BYTES += p.data.numel() * p.data.element_size()
@@ -169,7 +166,10 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
                 k: v.to(device, non_blocking=True)
                 for k, v in module.state_dict().items()
             }
-            output = functional_call(module, device_state, args=args, kwargs=kwargs)
+            output = functional_call(module,
+                                     device_state,
+                                     args=args,
+                                     kwargs=kwargs)
             module.forward = forward
             return output
 
@@ -188,19 +188,14 @@ def make_layers(
     """
     from vllm.distributed.parallel_state import get_pp_group
     from vllm.distributed.utils import get_pp_indices
-
-    start_layer, end_layer = get_pp_indices(
-        num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
-    )
+    start_layer, end_layer = get_pp_indices(num_hidden_layers,
+                                            get_pp_group().rank_in_group,
+                                            get_pp_group().world_size)
     modules = torch.nn.ModuleList(
-        [PPMissingLayer() for _ in range(start_layer)]
-        + [
+        [PPMissingLayer() for _ in range(start_layer)] + [
             maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
             for idx in range(start_layer, end_layer)
-        ]
-        + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
-    )
-
+        ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
     return start_layer, end_layer, modules
 
 
@@ -220,7 +215,7 @@ def get_pp_missing_layer_names(model: torch.nn.Module) -> List[str]:
             # NOTE: the trailing dot is used to match the prefix of the layer.
             # without the dot, we could match a layer that is not missing,
             # e.g., 'encoder.layer.1' would match 'encoder.layer.11'
-            missing_layer_names.append(name + ".")
+            missing_layer_names.append(name + '.')
     _model_to_pp_missing_layer_names[model_id] = missing_layer_names
 
     return missing_layer_names
