@@ -2,9 +2,9 @@ import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Iterable, List, Mapping, Optional
 from typing import Sequence as GenericSequence
-from typing import Set, Tuple, Type, TypeVar, Union
+from typing import Set, Tuple, Type, Union
 
-from typing_extensions import assert_never
+from typing_extensions import TypeVar, assert_never
 
 import vllm.envs as envs
 from vllm.config import (
@@ -58,13 +58,12 @@ from vllm.sequence import (
 from vllm.tracing import SpanAttributes, SpanKind, extract_trace_context, init_tracer
 from vllm.transformers_utils.config import try_get_generation_config
 from vllm.transformers_utils.detokenizer import Detokenizer
+from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.transformers_utils.tokenizer_group import (
-    AnyTokenizer,
-    BaseTokenizerGroup,
-    init_tokenizer_from_configs,
-)
-from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_message
-from vllm.utils import Counter
+    BaseTokenizerGroup, init_tokenizer_from_configs)
+from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
+                                  usage_message)
+from vllm.utils import Counter, Device
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
@@ -84,6 +83,7 @@ def _load_generation_config_dict(model_config: ModelConfig) -> Dict[str, Any]:
     return config.to_diff_dict()
 
 
+_G = TypeVar("_G", bound=BaseTokenizerGroup, default=BaseTokenizerGroup)
 _O = TypeVar("_O", RequestOutput, EmbeddingRequestOutput)
 
 PromptComponents = Tuple[Optional[str], List[int], Optional[MultiModalDataDict]]
@@ -244,7 +244,6 @@ class LLMEngine:
             cache_config.enable_prefix_caching,
         )
         # TODO(woosuk): Print more configs in debug mode.
-
         from vllm.plugins import load_general_plugins
 
         load_general_plugins()
@@ -517,12 +516,21 @@ class LLMEngine:
     )
 
     def get_tokenizer_group(
-        self, fail_msg: str = MISSING_TOKENIZER_GROUP_MSG
-    ) -> BaseTokenizerGroup:
-        if self.tokenizer is None:
-            raise ValueError(fail_msg)
+        self,
+        group_type: Type[_G] = BaseTokenizerGroup,
+        *,
+        missing_msg: str = MISSING_TOKENIZER_GROUP_MSG,
+    ) -> _G:
+        tokenizer_group = self.tokenizer
 
-        return self.tokenizer
+        if tokenizer_group is None:
+            raise ValueError(missing_msg)
+        if not isinstance(tokenizer_group, group_type):
+            raise TypeError("Invalid type of tokenizer group. "
+                            f"Expected type: {group_type}, but "
+                            f"found type: {type(tokenizer_group)}")
+
+        return tokenizer_group
 
     def get_tokenizer(
         self,
@@ -736,8 +744,7 @@ class LLMEngine:
         """
 
         tokenizer = self.get_tokenizer_group(
-            "prompts must be None if " "skip_tokenizer_init is True"
-        )
+            missing_msg="prompts must be None if skip_tokenizer_init is True")
 
         return tokenizer.encode(
             request_id=request_id, prompt=prompt, lora_request=lora_request
@@ -1336,9 +1343,14 @@ class LLMEngine:
         if self.parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
                 "Pipeline parallelism is only supported through AsyncLLMEngine "
-                "as performance will be severely degraded otherwise."
-            )
-        seq_group_metadata_list, scheduler_outputs = self.scheduler[0].schedule()
+                "as performance will be severely degraded otherwise.")
+
+        if self.scheduler_config.num_scheduler_steps > 1:
+            raise NotImplementedError(
+                "Multiple scheduler steps (multi-step) are only supported "
+                "through AsyncLLMEngine. ")
+        seq_group_metadata_list, scheduler_outputs = self.scheduler[
+            0].schedule()
 
         if not scheduler_outputs.is_empty():
             finished_requests_ids = self.scheduler[
@@ -1443,6 +1455,13 @@ class LLMEngine:
                 for scheduler in self.scheduler
             )
             cpu_cache_usage_sys = 1.0 - (num_free_cpu / num_total_cpu)
+
+        # Prefix Cache Hit Rate. Note that we always use
+        # the cache hit rate of the first virtual engine.
+        cpu_prefix_cache_hit_rate = self.scheduler[
+            0].get_prefix_cache_hit_rate(Device.CPU)
+        gpu_prefix_cache_hit_rate = self.scheduler[
+            0].get_prefix_cache_hit_rate(Device.GPU)
 
         # Iteration stats
         num_prompt_tokens_iter = 0
@@ -1553,6 +1572,10 @@ class LLMEngine:
             #   KV Cache Usage in %
             gpu_cache_usage_sys=gpu_cache_usage_sys,
             cpu_cache_usage_sys=cpu_cache_usage_sys,
+            #   Prefix Cache Hit Rate
+            cpu_prefix_cache_hit_rate=cpu_prefix_cache_hit_rate,
+            gpu_prefix_cache_hit_rate=gpu_prefix_cache_hit_rate,
+
             # Iteration stats
             num_prompt_tokens_iter=num_prompt_tokens_iter,
             num_generation_tokens_iter=num_generation_tokens_iter,

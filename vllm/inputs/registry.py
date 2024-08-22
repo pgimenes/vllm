@@ -1,8 +1,9 @@
 import functools
+from array import array
 from collections import UserDict
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Callable, Dict, Mapping, Optional, Protocol,
-                    Tuple, Type)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Mapping, Optional,
+                    Protocol, Tuple, Type)
 
 from torch import nn
 from transformers import PretrainedConfig
@@ -20,6 +21,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 C = TypeVar("C", bound=PretrainedConfig, default=PretrainedConfig)
+
+# NOTE: This has to match with sequence.py's VLLM_TOKEN_ID_ARRAY_TYPE.
+# We cannot import it here because of circular dependencies.
+VLLM_TOKEN_ID_ARRAY_TYPE = "l"
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,13 @@ class InputContext:
                             f"found type: {type(hf_config)}")
 
         return hf_config
+
+    def get_hf_image_processor_config(self) -> Dict[str, Any]:
+        """
+        Get the HuggingFace image processor configuration of the model.
+        """
+
+        return self.model_config.hf_image_processor_config
 
 
 N = TypeVar("N", bound=Type[nn.Module])
@@ -118,7 +130,8 @@ class InputRegistry:
         # Avoid circular import
         from vllm.sequence import SequenceData
 
-        dummy_seq_data = SequenceData([0] * seq_len)
+        dummy_seq_data = SequenceData(
+            array(VLLM_TOKEN_ID_ARRAY_TYPE, [0]) * seq_len)
         dummy_multi_modal_data = None
 
         return dummy_seq_data, dummy_multi_modal_data

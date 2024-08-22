@@ -12,14 +12,12 @@ from xformers.ops.fmha.attn_bias import (
     LowerTriangularMaskWithTensorBias,
 )
 
-from vllm.attention.backends.abstract import (
-    AttentionBackend,
-    AttentionImpl,
-    AttentionMetadata,
-    AttentionType,
-)
-from vllm.attention.backends.utils import CommonMetadataBuilder
-from vllm.attention.ops.paged_attn import PagedAttention, PagedAttentionMetadata
+from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
+                                              AttentionMetadata, AttentionType)
+from vllm.attention.backends.utils import (CommonAttentionState,
+                                           CommonMetadataBuilder)
+from vllm.attention.ops.paged_attn import (PagedAttention,
+                                           PagedAttentionMetadata)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -42,6 +40,10 @@ class XFormersBackend(AttentionBackend):
     @staticmethod
     def get_builder_cls() -> Type["XFormersMetadataBuilder"]:
         return XFormersMetadataBuilder
+
+    @staticmethod
+    def get_state_cls() -> Type["CommonAttentionState"]:
+        return CommonAttentionState
 
     @staticmethod
     def get_kv_cache_shape(
