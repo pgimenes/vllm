@@ -667,7 +667,6 @@ class QKVReplicatedLinear(ReplicatedLinear):
             prefix=prefix,
         )
 
-
 class QKVParallelLinear(ColumnParallelLinear):
     """Linear layers for the attention's QKV transformation.
 
@@ -1118,7 +1117,6 @@ class RowParallelLinear(LinearBase):
         s += f", tp_size={self.tp_size}"
         s += f", reduce_results={self.reduce_results}"
         return s
-
 
 class QKVRowParallelLinear(RowParallelLinear):
     """
