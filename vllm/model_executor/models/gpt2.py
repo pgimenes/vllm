@@ -31,12 +31,14 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
-    QKVParallelLinear,
-    QKVRowParallelLinear,
-    QKVReplicatedLinear,
-    RowParallelLinear,
     ReplicatedLinear,
+    RowParallelLinear,
+    ColumnParallelLinear,
+    DataParallelLinear,
+    QKVReplicatedLinear,
+    QKVRowParallelLinear,
+    QKVParallelLinear,
+    QKVDataParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -57,17 +59,21 @@ def _linear_cls_from_config(config: str):
         return ColumnParallelLinear
     if config == "row":
         return RowParallelLinear
+    if config == "data":
+        return DataParallelLinear
 
     raise ValueError(f"Unknown linear config: {config}")
 
 
 def _qkv_linear_cls_from_config(config: str):
+    if config == "replicated":
+        return QKVReplicatedLinear
     if config == "column":
         return QKVParallelLinear
     if config == "row":
         return QKVRowParallelLinear
-    if config == "replicated":
-        return QKVReplicatedLinear
+    if config == "data":
+        return QKVDataParallelLinear
 
     raise ValueError(f"Unknown linear config: {config}")
 
@@ -111,6 +117,9 @@ class GPT2Attention(nn.Module):
             c_attn_args["gather_output"] = True
         if c_attn_type == "row":
             c_attn_args["input_is_parallel"] = False
+        if c_attn_type == "data":
+            c_attn_args["gather_output"] = True
+            c_attn_args["input_is_parallel"] = False
         self.c_attn = _qkv_linear_cls_from_config(c_attn_type)(
             **c_attn_args,
         )
@@ -147,6 +156,9 @@ class GPT2Attention(nn.Module):
             c_proj_args["gather_output"] = True
         if c_proj_type == "row" and attn_type != "column":
             c_proj_args["input_is_parallel"] = False
+        if c_proj_type == "data":
+            c_proj_args["input_is_parallel"] = False
+            c_proj_args["gather_output"] = True
 
         self.c_proj = _linear_cls_from_config(c_proj_type)(
             **c_proj_args,
@@ -199,6 +211,10 @@ class GPT2MLP(nn.Module):
         # Input will never have RS sharding due to LayerNorm
         elif c_fc_type == "row":
             c_fc_args["input_is_parallel"] = False
+        elif c_fc_type == "data":
+            if c_proj_type != "data":
+                c_fc_args["gather_output"] = True
+            c_fc_args["input_is_parallel"] = False
 
         self.c_fc = _linear_cls_from_config(c_fc_type)(
             **c_fc_args,
@@ -218,6 +234,10 @@ class GPT2MLP(nn.Module):
         # If previous layer was column parallel, input tensor already has RS sharding
         elif c_proj_type == "row" and c_fc_type != "column":
             c_proj_args["input_is_parallel"] = False
+        if c_proj_type == "data":
+            if c_fc_type != "data":
+                c_proj_args["input_is_parallel"] = False
+            c_proj_args["gather_output"] = True
 
         self.c_proj = _linear_cls_from_config(c_proj_type)(
             **c_proj_args,

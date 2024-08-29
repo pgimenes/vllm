@@ -52,6 +52,31 @@ def split_tensor_along_last_dim(
 
     return tensor_list
 
+def split_tensor_along_first_dim(
+    tensor: torch.Tensor,
+    num_partitions: int,
+    contiguous_split_chunks: bool = False,
+) -> Sequence[torch.Tensor]:
+    """ Split a tensor along its first (data) dimension.
+
+        Arguments:
+            tensor: input tensor.
+            num_partitions: number of partitions to split the tensor
+            contiguous_split_chunks: If True, make each chunk contiguous
+                                     in memory.
+
+        Returns:
+            A list of Tensors
+    """
+    # Get the size and dimension.
+    last_dim_size = divide(tensor.size()[0], num_partitions)
+    # Split.
+    tensor_list = torch.split(tensor, last_dim_size, dim=0)
+    # NOTE: torch.split does not create contiguous tensors by default.
+    if contiguous_split_chunks:
+        return tuple(chunk.contiguous() for chunk in tensor_list)
+
+    return tensor_list
 
 def get_pp_indices(num_hidden_layers: int, pp_rank: int,
                    pp_size: int) -> Tuple[int, int]:
