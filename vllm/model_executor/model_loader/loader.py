@@ -157,7 +157,7 @@ def build_model(model_class: Type[nn.Module], hf_config: PretrainedConfig,
         config=hf_config,
         cache_config=cache_config,
         quant_config=quant_config,
-        sharding_config=sharding_config,
+        sharding_config=parallel_config.sharding_config,
         **extra_kwargs,
     )
 
