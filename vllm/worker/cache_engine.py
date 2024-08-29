@@ -79,9 +79,8 @@ class CacheEngine:
         for layer in range(self.num_attention_layers):
 
             num_kv_heads = self.num_kv_heads
-            if (self.parallel_config.
-                    sharding_config[f"transformer.h.{layer}.attn.attn"] !=
-                    "replicated"):
+            attn_type = self.parallel_config.sharding_config.get("transformer.h.{layer}.attn.attn", None)
+            if (attn_type != "replicated"):
                 num_kv_heads //= self.parallel_config.tensor_parallel_size
 
             kv_cache_shape = self.attn_backend.get_kv_cache_shape(
@@ -128,8 +127,8 @@ class CacheEngine:
 
         total = 0
         for layer in range(num_attention_layers):
-            if (parallel_config.sharding_config[
-                    f"transformer.h.{layer}.attn.attn"] == "replicated"):
+            attn_type = parallel_config.sharding_config.get(f"transformer.h.{layer}.attn.attn", None)
+            if (attn_type == "replicated"):
                 num_heads = model_config.get_total_num_kv_heads()
             else:
                 num_heads = model_config.get_num_kv_heads(parallel_config)

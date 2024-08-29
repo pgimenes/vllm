@@ -47,6 +47,7 @@ class Attention(nn.Module):
         gather_output: bool = False,
     ) -> None:
         super().__init__()
+        self.prefix = prefix
         if cache_config is not None:
             kv_cache_dtype = cache_config.cache_dtype
             block_size = cache_config.block_size

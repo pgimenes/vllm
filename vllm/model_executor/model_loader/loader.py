@@ -153,11 +153,56 @@ def build_model(model_class: Type[nn.Module], hf_config: PretrainedConfig,
                                                     multimodal_config,
                                                     scheduler_config)
 
-    return model_class(config=hf_config,
-                       cache_config=cache_config,
-                       quant_config=quant_config,
-                       sharding_config=parallel_config.sharding_config,
-                       **extra_kwargs)
+    model = model_class(
+        config=hf_config,
+        cache_config=cache_config,
+        quant_config=quant_config,
+        sharding_config=sharding_config,
+        **extra_kwargs,
+    )
+
+    from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
+
+    rank = get_tensor_model_parallel_rank()
+    tp_group = get_tp_group()
+
+    if rank == 0:
+        import chop.passes as passes
+
+        model, pass_outs = passes.autosharding_module_analysis_pass(
+            model,
+            pass_args={
+                "debug": True,
+                "time_limit": 100000,
+                "mip_rel_gap": 0,
+                "intra_device_bandwidth": 19.294,  # gb/s
+                "intra_device_latency": 2.7,  # us
+                "data_size": 128,
+            },
+        )
+
+        torch.distributed.barrier()
+        sharding_config = pass_outs["sharding_config"]
+        _ = tp_group.broadcast_object(sharding_config, src=0)
+
+    else:
+        # broadcast the sharding config to all workers
+        torch.distributed.barrier()
+        sharding_config = get_tp_group().broadcast_object(None, src=0)
+
+    parallel_config.sharding_config = sharding_config
+
+    # Reinstantiate model with the new sharding configuration
+    del model
+    model = model_class(
+        config=hf_config,
+        cache_config=cache_config,
+        quant_config=quant_config,
+        sharding_config=sharding_config,
+        **extra_kwargs,
+    )
+
+    return model
 
 
 def _initialize_model(

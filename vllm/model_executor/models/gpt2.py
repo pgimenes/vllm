@@ -101,7 +101,7 @@ class GPT2Attention(nn.Module):
 
         # Get sharding types
         c_attn_type = sharding_config.get(f"{prefix}.c_attn", "column")
-        attn_type = sharding_config.get(f"{prefix}.attn", "column")
+        attn_type = sharding_config.get(f"{prefix}.attn", "head")
         c_proj_type = sharding_config.get(f"{prefix}.c_proj", "row")
 
         # c_attn
@@ -113,7 +113,7 @@ class GPT2Attention(nn.Module):
             "quant_config": quant_config,
             "prefix": f"{prefix}.c_attn",
         }
-        if c_attn_type == "column" and attn_type != "column":
+        if c_attn_type == "column" and attn_type != "head":
             c_attn_args["gather_output"] = True
         if c_attn_type == "row":
             c_attn_args["input_is_parallel"] = False
@@ -131,13 +131,14 @@ class GPT2Attention(nn.Module):
             "scale": self.scale,
             "cache_config": cache_config,
             "quant_config": quant_config,
+            "prefix": f"{prefix}.attn",
         }
 
         if attn_type == "replicated":
             attn_args["num_heads"] = total_num_heads
-        if attn_type == "column" and c_attn_type != "column":
+        if attn_type == "head" and c_attn_type != "column":
             attn_args["input_is_parallel"] = False
-        if attn_type == "column" and c_proj_type != "row":
+        if attn_type == "head" and c_proj_type != "row":
             attn_args["gather_output"] = True
 
         self.attn = Attention(
@@ -154,7 +155,7 @@ class GPT2Attention(nn.Module):
         }
         if c_proj_type == "column":
             c_proj_args["gather_output"] = True
-        if c_proj_type == "row" and attn_type != "column":
+        if c_proj_type == "row" and attn_type != "head":
             c_proj_args["input_is_parallel"] = False
         if c_proj_type == "data":
             c_proj_args["input_is_parallel"] = False
@@ -239,14 +240,14 @@ class GPT2MLP(nn.Module):
                 c_proj_args["input_is_parallel"] = False
             c_proj_args["gather_output"] = True
 
-        self.c_proj = _linear_cls_from_config(c_proj_type)(
-            **c_proj_args,
-        )
-
         self.act = get_act_fn(
             config.activation_function,
             quant_config,
             intermediate_size,
+        )
+
+        self.c_proj = _linear_cls_from_config(c_proj_type)(
+            **c_proj_args,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
