@@ -177,7 +177,7 @@ def build_model(model_class: Type[nn.Module], hf_config: PretrainedConfig,
                 "mip_rel_gap": 0,
                 "intra_device_bandwidth": 19.294,  # gb/s
                 "intra_device_latency": 2.7,  # us
-                "data_size": 128,
+                "data_size": 8,
             },
         )
 
@@ -188,7 +188,7 @@ def build_model(model_class: Type[nn.Module], hf_config: PretrainedConfig,
     else:
         # broadcast the sharding config to all workers
         torch.distributed.barrier()
-        sharding_config = get_tp_group().broadcast_object(None, src=0)
+        sharding_config = tp_group.broadcast_object(None, src=0)
 
     parallel_config.sharding_config = sharding_config
 

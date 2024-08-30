@@ -20,6 +20,7 @@
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from transformers import GPT2Config
 
@@ -40,6 +41,11 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     QKVDataParallelLinear,
 )
+
+from vllm.distributed import (get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size,
+                              tensor_model_parallel_all_gather,
+                              split_tensor_along_first_dim)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.sampler import Sampler
@@ -103,6 +109,14 @@ class GPT2Attention(nn.Module):
         c_attn_type = sharding_config.get(f"{prefix}.c_attn", "column")
         attn_type = sharding_config.get(f"{prefix}.attn", "head")
         c_proj_type = sharding_config.get(f"{prefix}.c_proj", "row")
+        
+        # First linear layer of the MLP in the current GPT2 block
+        mlp_c_fc_type = sharding_config.get(f"{prefix.replace('attn', 'mlp')}.c_fc", "column")
+
+        # Last linear layer of the MLP in the previous GPT2 block
+        layer_num = "".join(filter(str.isdigit, prefix))
+        previous_layer_num = str(int(layer_num) - 1)
+        prev_layer_mlp_c_proj = sharding_config.get(f"{prefix.replace(layer_num, previous_layer_num).replace('attn', 'mlp')}.c_proj", "row")
 
         # c_attn
         c_attn_args = {
@@ -119,7 +133,9 @@ class GPT2Attention(nn.Module):
             c_attn_args["input_is_parallel"] = False
         if c_attn_type == "data":
             c_attn_args["gather_output"] = True
-            c_attn_args["input_is_parallel"] = False
+
+            if prev_layer_mlp_c_proj != "data":
+                c_attn_args["input_is_parallel"] = False
         self.c_attn = _qkv_linear_cls_from_config(c_attn_type)(
             **c_attn_args,
         )
@@ -159,7 +175,9 @@ class GPT2Attention(nn.Module):
             c_proj_args["input_is_parallel"] = False
         if c_proj_type == "data":
             c_proj_args["input_is_parallel"] = False
-            c_proj_args["gather_output"] = True
+
+            if mlp_c_fc_type != "data":
+                c_proj_args["gather_output"] = True
 
         self.c_proj = _linear_cls_from_config(c_proj_type)(
             **c_proj_args,
@@ -192,9 +210,20 @@ class GPT2MLP(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
 
+        self.prefix = prefix
+        self.is_last_layer = str(config.n_layer - 1) in prefix
+
         # Get sharding types
         c_fc_type = sharding_config.get(f"{prefix}.c_fc", "column")
         c_proj_type = sharding_config.get(f"{prefix}.c_proj", "row")
+
+        # Last linear block of the attention block (before MLP)
+        attn_c_proj_type = sharding_config.get(f"{prefix.replace('mlp', 'attn')}.c_proj", "row")
+
+        # First linear layer of the next GPT2 block
+        layer_num = "".join(filter(str.isdigit, prefix))
+        next_layer_num = str(int(layer_num) + 1)
+        next_layer_attn_c_fc = sharding_config.get(f"{prefix.replace(layer_num, next_layer_num).replace('mlp', 'attn')}.c_attn", "column")
 
         # c_fc
         c_fc_args = {
@@ -215,13 +244,16 @@ class GPT2MLP(nn.Module):
         elif c_fc_type == "data":
             if c_proj_type != "data":
                 c_fc_args["gather_output"] = True
-            c_fc_args["input_is_parallel"] = False
+
+            if attn_c_proj_type != "data":
+                c_fc_args["input_is_parallel"] = False
 
         self.c_fc = _linear_cls_from_config(c_fc_type)(
             **c_fc_args,
         )
 
         # c_proj
+        self.gather_output = False
         c_proj_args = {
             "input_size": intermediate_size,
             "output_size": hidden_size,
@@ -238,7 +270,11 @@ class GPT2MLP(nn.Module):
         if c_proj_type == "data":
             if c_fc_type != "data":
                 c_proj_args["input_is_parallel"] = False
-            c_proj_args["gather_output"] = True
+
+            # Gather only if the attn.c_fc for the next layer is not data
+            if next_layer_attn_c_fc != "data" or self.is_last_layer:
+                self.gather_output = True
+                c_proj_args["gather_output"] = True
 
         self.act = get_act_fn(
             config.activation_function,
@@ -271,6 +307,19 @@ class GPT2Block(nn.Module):
         hidden_size = config.hidden_size
         inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
+        self.sharding_config = sharding_config
+        self.prefix = prefix
+
+        # Get sharding types
+        self.attn_c_proj_type = self.sharding_config.get(f"{self.prefix}.attn.c_proj", "row")
+        self.mlp_c_proj_type = self.sharding_config.get(f"{self.prefix}.mlp.c_proj", "row")
+
+        # Last linear layer of the MLP in the last GPT2 block
+        layer_num = "".join(filter(str.isdigit, prefix))
+        self.is_first_layer = layer_num == "0"
+        last_layer_num = str(int(layer_num) - 1)
+        self.prev_layer_mlp_c_proj_type = self.sharding_config.get(f"{self.prefix.replace(layer_num, last_layer_num)}.mlp.c_proj", "row")
+
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.attn = GPT2Attention(
             config,
@@ -291,6 +340,9 @@ class GPT2Block(nn.Module):
             sharding_config=sharding_config,
         )
 
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -304,13 +356,24 @@ class GPT2Block(nn.Module):
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
         )
+
         # residual connection
+        if self.attn_c_proj_type == "data" and (self.is_first_layer or self.prev_layer_mlp_c_proj_type != "data"):
+            splitted_residual = split_tensor_along_first_dim(
+                residual, num_partitions=self.tp_size)
+            residual = splitted_residual[self.tp_rank].contiguous()
+
         hidden_states = attn_output + residual
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
         feed_forward_hidden_states = self.mlp(hidden_states)
+        
         # residual connection
+        if self.attn_c_proj_type == "data" and (self.mlp_c_proj_type != "data" or (self.mlp_c_proj_type == "data" and self.mlp.gather_output)):
+            residual = tensor_model_parallel_all_gather(residual,
+                                                      dim=0)
+
         hidden_states = residual + feed_forward_hidden_states
         return hidden_states
 

@@ -704,7 +704,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                  skip_bias_add: bool = False,
                  params_dtype: Optional[torch.dtype] = None,
                  quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
+                 prefix: str = "",
+                 gather_output: bool = False):
         self.hidden_size = hidden_size
         self.head_size = head_size
         self.total_num_heads = total_num_heads
@@ -733,11 +734,11 @@ class QKVParallelLinear(ColumnParallelLinear):
         super().__init__(input_size=input_size,
                          output_size=output_size,
                          bias=bias,
-                         gather_output=False,
                          skip_bias_add=skip_bias_add,
                          params_dtype=params_dtype,
                          quant_config=quant_config,
-                         prefix=prefix)
+                         prefix=prefix,
+                         gather_output=gather_output)
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
         shard_offset_mapping = {
