@@ -79,7 +79,7 @@ class CacheEngine:
         for layer in range(self.num_attention_layers):
 
             num_kv_heads = self.num_kv_heads
-            attn_type = self.parallel_config.sharding_config.get("transformer.h.{layer}.attn.attn", None)
+            attn_type = self.parallel_config.sharding_config.get(f"transformer.h.{layer}.attn.attn", None)
             if (attn_type != "replicated"):
                 num_kv_heads //= self.parallel_config.tensor_parallel_size
 
