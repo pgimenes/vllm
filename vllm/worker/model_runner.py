@@ -875,6 +875,13 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         self.sampling_metadata_cache: SamplingMetadataCache = \
             SamplingMetadataCache()
 
+        # Dynamic resharding
+        self.rolling_window_size = 10
+        self.token_length_range = [4, 8, 16, 32, 64, 128]
+        self.token_length_range += list(range(256, 256 * 17, 256))
+        self.token_length_history = []
+        self._current_sharding_soln = 0
+
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
         with CudaMemoryProfiler() as m:
@@ -1411,6 +1418,30 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_start = torch.cuda.Event(enable_timing=True)
             model_forward_end = torch.cuda.Event(enable_timing=True)
             model_forward_start.record()
+
+        # def _get_sharding_config(data_size: int):
+        #     # unpickle solution dictionary
+        #     pass
+
+        # if model_input.is_prompt:
+        #     data_size = model_input.input_tokens.size(0)
+        #     self.token_length_history.append(data_size)
+
+        #     closest = self._current_sharding_soln
+        #     if len (self.token_length_history) > self.rolling_window_size:
+        #         def find_closest(num_list, target):
+        #             closest = min(num_list, key=lambda x: abs(x - target))
+        #             return closest
+                
+        #         avg = sum(self.token_length_history[-self.rolling_window_size:]) / self.rolling_window_size
+        #         closest = find_closest(self.token_length_range, avg)
+
+        #     if closest != self._current_sharding_soln:
+        #         logger.info(f"Resharding from data_size={self._current_sharding_soln} -> {closest}")
+        #         self._current_sharding_soln = closest
+        #         self.parallel_config.sharding_config = _get_sharding_config(token_length = closest)
+        #         self.load_model()
+        #         model_executable = self.model
 
         hidden_or_intermediate_states = model_executable(
             input_ids=model_input.input_tokens,

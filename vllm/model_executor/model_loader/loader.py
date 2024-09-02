@@ -153,18 +153,22 @@ def build_model(model_class: Type[nn.Module], hf_config: PretrainedConfig,
                                                     multimodal_config,
                                                     scheduler_config)
 
-    model = model_class(
-        config=hf_config,
-        cache_config=cache_config,
-        quant_config=quant_config,
-        sharding_config=parallel_config.sharding_config,
-        **extra_kwargs,
-    )
+    from accelerate import init_empty_weights
+    with init_empty_weights():
+        model = model_class(
+            config=hf_config,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            sharding_config=parallel_config.sharding_config,
+            **extra_kwargs,
+        )
 
     from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
 
     rank = get_tensor_model_parallel_rank()
     tp_group = get_tp_group()
+
+    data_size = int(os.environ.get("VLLM_AUTOSHARDING_DATA_SIZE"))
 
     if rank == 0:
         import chop.passes as passes
@@ -177,13 +181,20 @@ def build_model(model_class: Type[nn.Module], hf_config: PretrainedConfig,
                 "mip_rel_gap": 0,
                 "intra_device_bandwidth": 19.294,  # gb/s
                 "intra_device_latency": 2.7,  # us
-                "data_size": 8,
+                "data_size": data_size,
             },
         )
 
-        torch.distributed.barrier()
         sharding_config = pass_outs["sharding_config"]
+        
+        # dump the solution dictionary to dill file
+        import dill
+        with open(f"sharding_config_data_size_{data_size}.dill", "wb") as f:
+            dill.dump(sharding_config, f)
+
+        torch.distributed.barrier()
         _ = tp_group.broadcast_object(sharding_config, src=0)
+
 
     else:
         # broadcast the sharding config to all workers
