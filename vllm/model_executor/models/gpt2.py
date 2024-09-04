@@ -358,8 +358,13 @@ class GPT2Block(nn.Module):
             attn_metadata=attn_metadata,
         )
 
-        # residual connection
-        if self.attn_c_proj_type == "data" and (self.is_first_layer or self.prev_layer_mlp_c_proj_type != "data"):
+        # Data arrives into this layer in SR but attention generates RR or RS
+        if self.prev_layer_mlp_c_proj_type == "data" and self.attn_c_proj_type != "data":
+            residual = tensor_model_parallel_all_gather(residual,
+                                                      dim=0)
+        
+        # Data arrives into this layer in RR or RS but attention generates SR
+        elif self.attn_c_proj_type == "data" and (self.is_first_layer or self.prev_layer_mlp_c_proj_type != "data"):
             splitted_residual = split_tensor_along_first_dim(
                 residual, num_partitions=self.tp_size)
             residual = splitted_residual[self.tp_rank].contiguous()
@@ -370,10 +375,15 @@ class GPT2Block(nn.Module):
         hidden_states = self.ln_2(hidden_states)
         feed_forward_hidden_states = self.mlp(hidden_states)
         
-        # residual connection
+        # Attention generates SR but MLP requires RR or RS
         if self.attn_c_proj_type == "data" and (self.mlp_c_proj_type != "data" or (self.mlp_c_proj_type == "data" and self.mlp.gather_output)):
             residual = tensor_model_parallel_all_gather(residual,
                                                       dim=0)
+
+        # Attention generates RR or RS but MLP requires SR
+        elif self.mlp_c_proj_type == "data" and self.attn_c_proj_type != "data":
+            splitted_residual = split_tensor_along_first_dim(residual, num_partitions=self.tp_size)
+            residual = splitted_residual[self.tp_rank].contiguous()
 
         hidden_states = residual + feed_forward_hidden_states
         return hidden_states
