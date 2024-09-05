@@ -6,21 +6,39 @@ from vllm.distributed import (get_tensor_model_parallel_rank,
                               split_tensor_along_first_dim,
                               tensor_model_parallel_all_gather)
 
-class ReplicatedResidual(nn.Module):
-    def __init__(self):
-        super(ReplicatedResidual, self).__init__()
+class ResidualBase(nn.Module):
+    def __init__(
+        self, 
+        prefix: str = None,
+        hidden_size: int = 0,
+    ):
+        super(ResidualBase, self).__init__()
+
+        self.prefix = prefix
+
+        # passed as a hint to the model parallelism
+        self.hidden_size = hidden_size
 
     def forward(self, feedforward, residual):
         return feedforward + residual
 
-class DataParallelResidual(nn.Module):
+class ReplicatedResidual(ResidualBase):
+    def forward(self, feedforward, residual):
+        return super(ReplicatedResidual, self).forward(feedforward, residual)
+
+class DataParallelResidual(ResidualBase):
     def __init__(
         self,
         input_is_parallel: bool = True,
         residual_is_parallel: bool = True,
-        gather_output: bool = True,
+        gather_output: bool = False,
+        prefix: str = None,
+        hidden_size: int = 0,
     ):
-        super(DataParallelResidual, self).__init__()
+        super(DataParallelResidual, self).__init__(
+            prefix,
+            hidden_size,
+        )
 
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()

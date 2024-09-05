@@ -356,6 +356,7 @@ class GPT2Block(nn.Module):
         ln_1_kwargs = {
             "normalized_shape": hidden_size,
             "eps": config.layer_norm_epsilon,
+            "prefix": f"{prefix}.ln_1",
         }
         if self.ln_1_type == "data":
             if self.is_first_layer or self.prev_layer_res_2 != "data":
@@ -375,9 +376,11 @@ class GPT2Block(nn.Module):
         )
 
         # res_1
-        
         res_1_cls = _residual_cls_from_config(self.res_1_type)
-        res_1_kwargs = {}
+        res_1_kwargs = {
+            "prefix": f"{prefix}.res_1",
+            "hidden_size": hidden_size,
+        }
         if self.res_1_type == "data":
             # Feedforward is data parallel, residual is replicated
             if self.attn_c_proj_type == "data" and self.ln_1_type != "data":
@@ -391,6 +394,7 @@ class GPT2Block(nn.Module):
         ln_2_kwargs = {
             "normalized_shape": hidden_size,
             "eps": config.layer_norm_epsilon,
+            "prefix": f"{prefix}.ln_2",
         }
         if self.ln_2_type == "data":
             if self.res_1_type != "data":
@@ -410,7 +414,10 @@ class GPT2Block(nn.Module):
 
         # res_2
         res_2_cls = _residual_cls_from_config(self.res_2_type)
-        res_2_kwargs = {}
+        res_2_kwargs = {
+            "prefix": f"{prefix}.res_2",
+            "hidden_size": hidden_size,
+        }
         if self.res_2_type == "data":
             if self.mlp_c_proj_type == "data" and self.res_1_type != "data":
                 res_2_kwargs["input_is_parallel"] = False

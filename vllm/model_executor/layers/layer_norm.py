@@ -1,19 +1,17 @@
 
 import torch.nn as nn
-from torch import Size, Tensor
+from torch import Size
 
-from vllm.distributed import (divide, get_tensor_model_parallel_rank,
+from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
-                              split_tensor_along_last_dim,
                               split_tensor_along_first_dim,
-                              tensor_model_parallel_all_gather,
-                              tensor_model_parallel_all_reduce)
+                              tensor_model_parallel_all_gather)
 
 from typing import List, Optional, Tuple, Union
 
 _shape_t = Union[int, List[int], Size]
 
-class LayerNormBase(nn.Module):
+class LayerNormBase(nn.LayerNorm):
     def __init__(
         self,
         normalized_shape: _shape_t,
@@ -22,10 +20,10 @@ class LayerNormBase(nn.Module):
         bias: bool = True,
         device=None,
         dtype=None,
+        prefix: Optional[str] = None,
     ):
-        super(LayerNormBase, self).__init__()
-        self.ln = nn.LayerNorm(
-            normalized_shape,
+        super(LayerNormBase, self).__init__(
+            normalized_shape=normalized_shape,
             eps=eps,
             elementwise_affine=elementwise_affine,
             bias=bias,
@@ -33,12 +31,11 @@ class LayerNormBase(nn.Module):
             dtype=dtype,
         )
 
-    def forward(self, input_):
-        raise NotImplementedError
+        self.prefix = prefix
 
 class ReplicatedLayerNorm(LayerNormBase):
     def forward(self, input_):
-        return self.ln(input_)
+        return super(ReplicatedLayerNorm, self).forward(input_)
 
 class DataParallelLayerNorm(LayerNormBase):
     def __init__(
@@ -50,7 +47,8 @@ class DataParallelLayerNorm(LayerNormBase):
         device=None,
         dtype=None,
         input_is_parallel: bool = True,
-        gather_output: bool = True,
+        gather_output: bool = False,
+        prefix: Optional[str] = None,
     ):
         super(DataParallelLayerNorm, self).__init__(
             normalized_shape,
@@ -59,6 +57,7 @@ class DataParallelLayerNorm(LayerNormBase):
             bias=bias,
             device=device,
             dtype=dtype,
+            prefix=prefix,
         )
 
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -79,7 +78,7 @@ class DataParallelLayerNorm(LayerNormBase):
                 input_, num_partitions=self.tp_size)
             input_parallel = splitted[self.tp_rank].contiguous()
 
-        out = self.ln(input_parallel)
+        out = super(DataParallelLayerNorm, self).forward(input_parallel)
 
         if self.gather_output:
             out = tensor_model_parallel_all_gather(out, dim=0)
