@@ -41,6 +41,8 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     QKVDataParallelLinear,
 )
+from vllm.model_executor.layers.layer_norm import ReplicatedLayerNorm, DataParallelLayerNorm
+from vllm.model_executor.layers.residual import ReplicatedResidual, DataParallelResidual
 
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
@@ -84,6 +86,21 @@ def _qkv_linear_cls_from_config(config: str):
 
     raise ValueError(f"Unknown linear config: {config}")
 
+def _layer_norm_cls_from_config(config: str):
+    if config == "replicated":
+        return ReplicatedLayerNorm
+    if config == "data":
+        return DataParallelLayerNorm
+
+    raise ValueError(f"Unknown layer norm config: {config}")
+
+def _residual_cls_from_config(config: str):
+    if config == "replicated":
+        return ReplicatedResidual
+    if config == "data":
+        return DataParallelResidual
+
+    raise ValueError(f"Unknown residual config: {config}")
 
 class GPT2Attention(nn.Module):
 
@@ -311,17 +328,41 @@ class GPT2Block(nn.Module):
         self.sharding_config = sharding_config
         self.prefix = prefix
 
-        # Get sharding types
-        self.attn_c_proj_type = self.sharding_config.get(f"{self.prefix}.attn.c_proj", "row")
-        self.mlp_c_proj_type = self.sharding_config.get(f"{self.prefix}.mlp.c_proj", "row")
-
         # Last linear layer of the MLP in the last GPT2 block
         layer_num = "".join(filter(str.isdigit, prefix))
         self.is_first_layer = layer_num == "0"
         last_layer_num = str(int(layer_num) - 1)
-        self.prev_layer_mlp_c_proj_type = self.sharding_config.get(f"{self.prefix.replace(layer_num, last_layer_num)}.mlp.c_proj", "row")
+        next_layer_num = str(int(layer_num) + 1)
 
-        self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+        # Get sharding types
+        self.prev_layer_res_2 = self.sharding_config.get(f"{self.prefix.replace(layer_num, last_layer_num)}.res_2", "replicated")
+
+        self.ln_1_type = self.sharding_config.get(f"{self.prefix}.ln_1", "replicated")
+        self.attn_c_attn_type = self.sharding_config.get(f"{self.prefix}.attn.c_attn", "column")
+        self.attn_c_proj_type = self.sharding_config.get(f"{self.prefix}.attn.c_proj", "row")
+        self.res_1_type = self.sharding_config.get(f"{self.prefix}.res_1", "replicated")
+        self.ln_2_type = self.sharding_config.get(f"{self.prefix}.ln_2", "replicated")
+        self.mlp_c_fc_type = self.sharding_config.get(f"{self.prefix}.mlp.c_fc", "column")
+        self.mlp_c_proj_type = self.sharding_config.get(f"{self.prefix}.mlp.c_proj", "row")
+        self.res_2_type = self.sharding_config.get(f"{self.prefix}.res_2", "replicated")
+        
+        self.next_layer_ln_1_type = self.sharding_config.get(f"{self.prefix.replace(layer_num, next_layer_num)}.ln_1", "replicated")
+
+        # ln_1
+        ln_1_cls = _layer_norm_cls_from_config(self.ln_1_type)
+        ln_1_kwargs = {
+            "normalized_shape": hidden_size,
+            "eps": config.layer_norm_epsilon,
+        }
+        if self.ln_1_type == "data":
+            if self.is_first_layer or self.prev_layer_res_2 != "data":
+                ln_1_kwargs["input_is_parallel"] = False
+            if self.attn_c_attn_type != "data":
+                ln_1_kwargs["gather_output"] = True
+
+        self.ln_1 = ln_1_cls(**ln_1_kwargs)
+
+        # attn
         self.attn = GPT2Attention(
             config,
             cache_config,
@@ -329,10 +370,33 @@ class GPT2Block(nn.Module):
             prefix=f"{prefix}.attn",
             sharding_config=sharding_config,
         )
-        self.ln_2 = nn.LayerNorm(
-            hidden_size,
-            eps=config.layer_norm_epsilon,
-        )
+
+        # res_1
+        
+        res_1_cls = _residual_cls_from_config(self.res_1_type)
+        res_1_kwargs = {}
+        if self.res_1_type == "data":
+            # Feedforward is data parallel, residual is replicated
+            if self.attn_c_proj_type == "data" and self.ln_1_type != "data":
+                res_1_kwargs["input_is_parallel"] = False
+            if self.ln_2_type != "data":
+                res_1_kwargs["gather_output"] = True
+        self.res_1 = res_1_cls(**res_1_kwargs)
+
+        # ln_2
+        ln_2_cls = _layer_norm_cls_from_config(self.ln_2_type)
+        ln_2_kwargs = {
+            "normalized_shape": hidden_size,
+            "eps": config.layer_norm_epsilon,
+        }
+        if self.ln_2_type == "data":
+            if self.res_1_type != "data":
+                ln_2_kwargs["input_is_parallel"] = False
+            if self.mlp_c_fc_type != "data":
+                ln_2_kwargs["gather_output"] = True
+        self.ln_2 = ln_2_cls(**ln_2_kwargs)
+
+        # mlp
         self.mlp = GPT2MLP(
             inner_dim,
             config,
@@ -340,6 +404,17 @@ class GPT2Block(nn.Module):
             prefix=f"{prefix}.mlp",
             sharding_config=sharding_config,
         )
+
+        # res_2
+        res_2_cls = _residual_cls_from_config(self.res_2_type)
+        res_2_kwargs = {}
+        if self.res_2_type == "data":
+            if self.mlp_c_proj_type == "data" and self.res_1_type != "data":
+                res_2_kwargs["input_is_parallel"] = False
+            if self.next_layer_ln_1_type != "data":
+                res_2_kwargs["gather_output"] = False
+
+        self.res_2 = res_2_cls(**res_2_kwargs)
 
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -358,34 +433,19 @@ class GPT2Block(nn.Module):
             attn_metadata=attn_metadata,
         )
 
-        # Data arrives into this layer in SR but attention generates RR or RS
-        if self.prev_layer_mlp_c_proj_type == "data" and self.attn_c_proj_type != "data":
-            residual = tensor_model_parallel_all_gather(residual,
-                                                      dim=0)
-        
-        # Data arrives into this layer in RR or RS but attention generates SR
-        elif self.attn_c_proj_type == "data" and (self.is_first_layer or self.prev_layer_mlp_c_proj_type != "data"):
-            splitted_residual = split_tensor_along_first_dim(
-                residual, num_partitions=self.tp_size)
-            residual = splitted_residual[self.tp_rank].contiguous()
-
-        hidden_states = attn_output + residual
+        hidden_states = self.res1(
+            feedforward=attn_output,
+            residual=residual
+        )
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
         feed_forward_hidden_states = self.mlp(hidden_states)
-        
-        # Attention generates SR but MLP requires RR or RS
-        if self.attn_c_proj_type == "data" and (self.mlp_c_proj_type != "data" or (self.mlp_c_proj_type == "data" and self.mlp.gather_output)):
-            residual = tensor_model_parallel_all_gather(residual,
-                                                      dim=0)
 
-        # Attention generates RR or RS but MLP requires SR
-        elif self.mlp_c_proj_type == "data" and self.attn_c_proj_type != "data":
-            splitted_residual = split_tensor_along_first_dim(residual, num_partitions=self.tp_size)
-            residual = splitted_residual[self.tp_rank].contiguous()
-
-        hidden_states = residual + feed_forward_hidden_states
+        hidden_states = self.res2(
+            feedforward=feed_forward_hidden_states,
+            residual=residual
+        )
         return hidden_states
 
 
@@ -418,7 +478,10 @@ class GPT2Model(nn.Module):
             ),
             prefix=f"{prefix}.h",
         )
-        self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+
+        ln_f_type = sharding_config.get(f"{prefix}.ln_f", "replicated")
+        ln_f_cls = _layer_norm_cls_from_config(ln_f_type)
+        self.ln_f = ln_f_cls(self.embed_dim, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
