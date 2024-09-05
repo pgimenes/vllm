@@ -232,7 +232,8 @@ def _initialize_model(
         load_config: LoadConfig,
         lora_config: Optional[LoRAConfig],
         cache_config: CacheConfig,
-        scheduler_config: Optional[SchedulerConfig] = None) -> nn.Module:
+        scheduler_config: Optional[SchedulerConfig] = None,
+        parallel_config: Optional[ParallelConfig] = None) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
 
@@ -244,6 +245,7 @@ def _initialize_model(
         lora_config=lora_config,
         multimodal_config=model_config.multimodal_config,
         scheduler_config=scheduler_config,
+        parallel_config=parallel_config,
     )
 
 
@@ -409,14 +411,18 @@ class DefaultModelLoader(BaseModelLoader):
             with target_device:
                 model = _initialize_model(model_config, self.load_config,
                                           lora_config, cache_config,
-                                          scheduler_config)
-            model.load_weights(
-                self._get_weights_iterator(model_config.model,
-                                           model_config.revision,
-                                           fall_back_to_pt=getattr(
-                                               model,
-                                               "fall_back_to_pt_during_load",
-                                               True)), )
+                                          scheduler_config, parallel_config)
+            
+            # todo: temporarily disabling weight load for debugging
+            # revert when done
+
+            # model.load_weights(
+            #     self._get_weights_iterator(model_config.model,
+            #                             model_config.revision,
+            #                             fall_back_to_pt=getattr(
+            #                                 model,
+            #                                 "fall_back_to_pt_during_load",
+            #                                 True)), )
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
@@ -450,7 +456,7 @@ class DummyModelLoader(BaseModelLoader):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config,
                                           lora_config, cache_config,
-                                          scheduler_config)
+                                          scheduler_config, parallel_config)
             # NOTE(woosuk): For accurate performance evaluation, we assign
             # random values to the weights.
             initialize_dummy_weights(model)

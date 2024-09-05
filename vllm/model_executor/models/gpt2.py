@@ -134,7 +134,8 @@ class GPT2Attention(nn.Module):
         # Last linear layer of the MLP in the previous GPT2 block
         layer_num = "".join(filter(str.isdigit, prefix))
         previous_layer_num = str(int(layer_num) - 1)
-        prev_layer_mlp_c_proj = sharding_config.get(f"{prefix.replace(layer_num, previous_layer_num).replace('attn', 'mlp')}.c_proj", "row")
+        ln_1_type = sharding_config.get(f"{prefix.replace(layer_num, previous_layer_num).replace('attn', '')}.ln_1", "replicated")
+        res_1_type = sharding_config.get(f"{prefix.replace(layer_num, previous_layer_num).replace('attn', '')}.res_1", "replicated")
 
         # c_attn
         c_attn_args = {
@@ -152,7 +153,7 @@ class GPT2Attention(nn.Module):
         if c_attn_type == "data":
             c_attn_args["gather_output"] = True
 
-            if prev_layer_mlp_c_proj != "data":
+            if ln_1_type != "data":
                 c_attn_args["input_is_parallel"] = False
         self.c_attn = _qkv_linear_cls_from_config(c_attn_type)(
             **c_attn_args,
@@ -194,7 +195,7 @@ class GPT2Attention(nn.Module):
         if c_proj_type == "data":
             c_proj_args["input_is_parallel"] = False
 
-            if mlp_c_fc_type != "data":
+            if res_1_type != "data":
                 c_proj_args["gather_output"] = True
 
         self.c_proj = _linear_cls_from_config(c_proj_type)(
@@ -237,11 +238,13 @@ class GPT2MLP(nn.Module):
 
         # Last linear block of the attention block (before MLP)
         attn_c_proj_type = sharding_config.get(f"{prefix.replace('mlp', 'attn')}.c_proj", "row")
+        ln_2_type = sharding_config.get(f"{prefix.replace('mlp', '')}.ln_2", "replicated")
 
         # First linear layer of the next GPT2 block
         layer_num = "".join(filter(str.isdigit, prefix))
         next_layer_num = str(int(layer_num) + 1)
         next_layer_attn_c_fc = sharding_config.get(f"{prefix.replace(layer_num, next_layer_num).replace('mlp', 'attn')}.c_attn", "column")
+        next_layer_ln_1_type = sharding_config.get(f"{prefix.replace(layer_num, next_layer_num).replace('mlp', '')}.ln_1", "replicated")
 
         # c_fc
         c_fc_args = {
@@ -263,7 +266,7 @@ class GPT2MLP(nn.Module):
             if c_proj_type != "data":
                 c_fc_args["gather_output"] = True
 
-            if attn_c_proj_type != "data":
+            if ln_2_type != "data":
                 c_fc_args["input_is_parallel"] = False
 
         self.c_fc = _linear_cls_from_config(c_fc_type)(
@@ -290,7 +293,7 @@ class GPT2MLP(nn.Module):
                 c_proj_args["input_is_parallel"] = False
 
             # Gather only if the attn.c_fc for the next layer is not data
-            if next_layer_attn_c_fc != "data" or self.is_last_layer:
+            if self.is_last_layer or next_layer_ln_1_type != "data":
                 self.gather_output = True
                 c_proj_args["gather_output"] = True
 
@@ -433,7 +436,7 @@ class GPT2Block(nn.Module):
             attn_metadata=attn_metadata,
         )
 
-        hidden_states = self.res1(
+        hidden_states = self.res_1(
             feedforward=attn_output,
             residual=residual
         )
@@ -442,7 +445,7 @@ class GPT2Block(nn.Module):
         hidden_states = self.ln_2(hidden_states)
         feed_forward_hidden_states = self.mlp(hidden_states)
 
-        hidden_states = self.res2(
+        hidden_states = self.res_2(
             feedforward=feed_forward_hidden_states,
             residual=residual
         )
