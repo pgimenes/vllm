@@ -188,7 +188,7 @@ def build_model(model_class: Type[nn.Module], hf_config: PretrainedConfig,
                 "time_limit": 100000,
                 "mip_rel_gap": 1,
                 "data_size": data_size,
-                "gpu_memory_budget": 0.65,
+                "gpu_memory_budget": 0.70,
             },
         )
 

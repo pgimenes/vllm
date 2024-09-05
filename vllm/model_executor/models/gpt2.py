@@ -355,8 +355,8 @@ class GPT2Block(nn.Module):
         ln_1_cls = _layer_norm_cls_from_config(self.ln_1_type)
         ln_1_kwargs = {
             "normalized_shape": hidden_size,
-            "eps": config.layer_norm_epsilon,
             "prefix": f"{prefix}.ln_1",
+            "eps": config.layer_norm_epsilon,
         }
         if self.ln_1_type == "data":
             if self.is_first_layer or self.prev_layer_res_2 != "data":
@@ -383,8 +383,10 @@ class GPT2Block(nn.Module):
         }
         if self.res_1_type == "data":
             # Feedforward is data parallel, residual is replicated
-            if self.attn_c_proj_type == "data" and self.ln_1_type != "data":
+            if self.attn_c_proj_type != "data":
                 res_1_kwargs["input_is_parallel"] = False
+            if self.is_first_layer or self.prev_layer_res_2 != "data":
+                res_1_kwargs["residual_is_parallel"] = False
             if self.ln_2_type != "data":
                 res_1_kwargs["gather_output"] = True
         self.res_1 = res_1_cls(**res_1_kwargs)
@@ -419,10 +421,12 @@ class GPT2Block(nn.Module):
             "hidden_size": hidden_size,
         }
         if self.res_2_type == "data":
-            if self.mlp_c_proj_type == "data" and self.res_1_type != "data":
+            if self.mlp_c_proj_type != "data":
                 res_2_kwargs["input_is_parallel"] = False
+            if self.res_1_type != "data":
+                res_2_kwargs["residual_is_parallel"] = False
             if self.next_layer_ln_1_type != "data":
-                res_2_kwargs["gather_output"] = False
+                res_2_kwargs["gather_output"] = True
 
         self.res_2 = res_2_cls(**res_2_kwargs)
 
@@ -443,10 +447,13 @@ class GPT2Block(nn.Module):
             attn_metadata=attn_metadata,
         )
 
-        hidden_states = self.res_1(
-            feedforward=attn_output,
-            residual=residual
-        )
+        try:
+            hidden_states = self.res_1(
+                feedforward=attn_output,
+                residual=residual
+            )
+        except Exception as e:
+            dist.breakpoint(0)
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
@@ -456,6 +463,7 @@ class GPT2Block(nn.Module):
             feedforward=feed_forward_hidden_states,
             residual=residual
         )
+
         return hidden_states
 
 
@@ -490,8 +498,20 @@ class GPT2Model(nn.Module):
         )
 
         ln_f_type = sharding_config.get(f"{prefix}.ln_f", "replicated")
+        final_mlp_c_proj = sharding_config.get(f"{prefix}.h.{self.end_layer}.mlp.c_proj", "row")
+
         ln_f_cls = _layer_norm_cls_from_config(ln_f_type)
-        self.ln_f = ln_f_cls(self.embed_dim, eps=config.layer_norm_epsilon)
+        ln_f_kwargs = {
+            "normalized_shape": self.embed_dim,
+            "eps": config.layer_norm_epsilon,
+            "prefix": f"{prefix}.ln_f",
+        }
+        if ln_f_type == "data":
+            if final_mlp_c_proj != "data":
+                ln_f_kwargs["input_is_parallel"] = False
+            ln_f_kwargs["gather_output"] = True
+
+        self.ln_f = ln_f_cls(**ln_f_kwargs)
 
     def forward(
         self,
