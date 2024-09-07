@@ -22,6 +22,7 @@ from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoadFormat,
                          LoRAConfig, ModelConfig, MultiModalConfig,
                          ParallelConfig, SchedulerConfig)
 from vllm.envs import VLLM_USE_MODELSCOPE
+from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
@@ -43,6 +44,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import is_pin_memory_available
 
+from accelerate import init_empty_weights
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module,
@@ -153,74 +155,11 @@ def build_model(model_class: Type[nn.Module], hf_config: PretrainedConfig,
         model_class, lora_config, multimodal_config, scheduler_config
     )
 
-    from accelerate import init_empty_weights
-
-    with init_empty_weights():
-        model = model_class(
-            config=hf_config,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            sharding_config=parallel_config.sharding_config,
-            **extra_kwargs,
-        )
-
-    from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
-
-    rank = get_tensor_model_parallel_rank()
-    tp_group = get_tp_group()
-
-    data_size = int(os.environ.get("VLLM_AUTOSHARDING_DATA_SIZE"))
-
-    import chop.passes as passes
-
-    use_pre_cached = False
-    if use_pre_cached:
-        # Load from dill file
-        import dill
-
-        with open(f"sharding_config_data_size_{data_size}.dill", "rb") as f:
-            sharding_config = dill.load(f)
-    else:
-        model, pass_outs = passes.autosharding_module_analysis_pass(
-            model,
-            pass_args={
-                "debug": rank == 0,
-                "time_limit": 100000,
-                "mip_rel_gap": 1,
-                "data_size": data_size,
-                "gpu_memory_budget": 0.70,
-            },
-        )
-
-        sharding_config = pass_outs["sharding_config"]
-
-    # Synchronize
-
-    if not use_pre_cached and rank == 0:
-        import dill
-
-        with open(f"sharding_config_data_size_{data_size}.dill", "wb") as f:
-            dill.dump(sharding_config, f)
-
-        # Broadcast solution
-        torch.distributed.barrier()
-        _ = tp_group.broadcast_object(sharding_config, src=0)
-
-    elif not use_pre_cached and rank != 0:
-        # Receive the sharding config from  config to all workers
-        torch.distributed.barrier()
-        sharding_config = tp_group.broadcast_object(None, src=0)
-
-    parallel_config.sharding_config = sharding_config
-
-    # Reinstantiate model with the new sharding configuration
-    del model
-    torch.cuda.empty_cache()
     model = model_class(
         config=hf_config,
         cache_config=cache_config,
         quant_config=quant_config,
-        sharding_config=sharding_config,
+        sharding_config=parallel_config.sharding_config,
         **extra_kwargs,
     )
 
@@ -413,16 +352,13 @@ class DefaultModelLoader(BaseModelLoader):
                                           lora_config, cache_config,
                                           scheduler_config, parallel_config)
             
-            # todo: temporarily disabling weight load for debugging
-            # revert when done
-
-            # model.load_weights(
-            #     self._get_weights_iterator(model_config.model,
-            #                             model_config.revision,
-            #                             fall_back_to_pt=getattr(
-            #                                 model,
-            #                                 "fall_back_to_pt_during_load",
-            #                                 True)), )
+            model.load_weights(
+                self._get_weights_iterator(model_config.model,
+                                        model_config.revision,
+                                        fall_back_to_pt=getattr(
+                                            model,
+                                            "fall_back_to_pt_during_load",
+                                            True)), )
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
@@ -1161,6 +1097,96 @@ class GGUFModelLoader(BaseModelLoader):
                 self._get_weights_iterator(local_model_path, gguf_weights_map))
         return model
 
+def _run_mase_autosharding(model: nn.Module, parallel_config: ParallelConfig):
+    import chop.passes as passes
+    import dill
+
+    rank = get_tensor_model_parallel_rank()
+    tp_group = get_tp_group()
+    data_size = int(os.environ.get("VLLM_AUTOSHARDING_DATA_SIZE"))
+    use_pre_cached = os.environ.get("VLLM_AUTOSHARDING_USE_CACHED") is not None
+
+    if use_pre_cached:
+        with open(f"sharding_config_data_size_{data_size}.dill", "rb") as f:
+            sharding_config = dill.load(f)
+    else:
+        model, pass_outs = passes.autosharding_module_analysis_pass(
+            model,
+            pass_args={
+                "debug": rank == 0,
+                "time_limit": 100000,
+                "mip_rel_gap": 2,
+                "data_size": data_size,
+                "gpu_memory_budget": 0.70,
+            },
+        )
+
+        sharding_config = pass_outs["sharding_config"]
+
+    # Synchronize
+
+    if not use_pre_cached and rank == 0:
+        # Save solution
+        with open(f"sharding_config_data_size_{data_size}.dill", "wb") as f:
+            dill.dump(sharding_config, f)
+
+        # Broadcast solution
+        torch.distributed.barrier()
+        _ = tp_group.broadcast_object(sharding_config, src=0)
+
+    elif not use_pre_cached and rank != 0:
+        # Receive the sharding config from rank 0
+        torch.distributed.barrier()
+        sharding_config = tp_group.broadcast_object(None, src=0)
+
+    return sharding_config
+
+
+class MaseModelLoader(DefaultModelLoader):
+    def load_model(self, *, model_config: ModelConfig,
+                   device_config: DeviceConfig,
+                   lora_config: Optional[LoRAConfig],
+                   parallel_config: ParallelConfig,
+                   scheduler_config: SchedulerConfig,
+                   cache_config: CacheConfig) -> nn.Module:
+        
+        target_device = torch.device(device_config.device)
+        with set_default_torch_dtype(model_config.dtype), target_device:
+            with init_empty_weights():
+                model = _initialize_model(model_config, self.load_config,
+                                        lora_config, cache_config,
+                                        scheduler_config, parallel_config)
+
+            # Pass 1: run autosharding if sharding config is not provided
+            if parallel_config.sharding_config is None or parallel_config.sharding_config == {}:
+                sharding_config = _run_mase_autosharding(model, parallel_config)
+                parallel_config.sharding_config = sharding_config
+
+            # After a series of passes, reinstantiate the model
+            model = _initialize_model(model_config, self.load_config,
+                                    lora_config, cache_config,
+                                    scheduler_config, parallel_config)
+            
+            # Load weights from checkpoint
+            # model.load_weights(
+            #     self._get_weights_iterator(model_config.model,
+            #                             model_config.revision,
+            #                             fall_back_to_pt=getattr(
+            #                                 model,
+            #                                 "fall_back_to_pt_during_load",
+            #                                 True)), )
+
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    # When quant methods need to process weights after loading
+                    # (for repacking, quantizing, etc), they expect parameters
+                    # to be on the global target device. This scope is for the
+                    # case where cpu offloading is used, where we will move the
+                    # parameters onto device for processing and back off after.
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+        return model.eval()
 
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
@@ -1182,5 +1208,8 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
 
     if load_config.load_format == LoadFormat.GGUF:
         return GGUFModelLoader(load_config)
+    
+    if load_config.load_format == LoadFormat.MASE:
+        return MaseModelLoader(load_config)
 
     return DefaultModelLoader(load_config)

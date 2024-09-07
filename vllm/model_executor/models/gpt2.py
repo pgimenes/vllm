@@ -243,8 +243,7 @@ class GPT2MLP(nn.Module):
         # First linear layer of the next GPT2 block
         layer_num = "".join(filter(str.isdigit, prefix))
         next_layer_num = str(int(layer_num) + 1)
-        next_layer_attn_c_fc = sharding_config.get(f"{prefix.replace(layer_num, next_layer_num).replace('mlp', 'attn')}.c_attn", "column")
-        next_layer_ln_1_type = sharding_config.get(f"{prefix.replace(layer_num, next_layer_num).replace('mlp', '')}.ln_1", "replicated")
+        res_2_type = sharding_config.get(f"{prefix.replace('mlp', '')}.res_2", "replicated")
 
         # c_fc
         c_fc_args = {
@@ -293,7 +292,7 @@ class GPT2MLP(nn.Module):
                 c_proj_args["input_is_parallel"] = False
 
             # Gather only if the attn.c_fc for the next layer is not data
-            if self.is_last_layer or next_layer_ln_1_type != "data":
+            if self.is_last_layer or res_2_type != "data":
                 self.gather_output = True
                 c_proj_args["gather_output"] = True
 
@@ -447,13 +446,10 @@ class GPT2Block(nn.Module):
             attn_metadata=attn_metadata,
         )
 
-        try:
-            hidden_states = self.res_1(
-                feedforward=attn_output,
-                residual=residual
-            )
-        except Exception as e:
-            dist.breakpoint(0)
+        hidden_states = self.res_1(
+            feedforward=attn_output,
+            residual=residual
+        )
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
