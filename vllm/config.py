@@ -833,6 +833,8 @@ class ParallelConfig:
         distributed_executor_backend: Optional[Union[
             str, Type["ExecutorBase"]]] = None,
         sharding_config: Optional[Dict[str, str]] = None,
+        prefill_sharding: Optional[Dict[str, str]] = None,
+        decode_sharding: Optional[Dict[str, str]] = None,
     ) -> None:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
@@ -843,7 +845,10 @@ class ParallelConfig:
         self.ray_workers_use_nsight = ray_workers_use_nsight
         self.placement_group = placement_group
         self.world_size = pipeline_parallel_size * self.tensor_parallel_size
+
         self.sharding_config = {} if sharding_config is None else sharding_config
+        self.prefill_sharding = {} if prefill_sharding is None else prefill_sharding
+        self.decode_sharding = {} if decode_sharding is None else decode_sharding
 
         if worker_use_ray:
             if self.distributed_executor_backend is None:

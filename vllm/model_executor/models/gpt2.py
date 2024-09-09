@@ -127,15 +127,15 @@ class GPT2Attention(nn.Module):
         c_attn_type = sharding_config.get(f"{prefix}.c_attn", "column")
         attn_type = sharding_config.get(f"{prefix}.attn", "head")
         c_proj_type = sharding_config.get(f"{prefix}.c_proj", "row")
-        
-        # First linear layer of the MLP in the current GPT2 block
-        mlp_c_fc_type = sharding_config.get(f"{prefix.replace('attn', 'mlp')}.c_fc", "column")
 
+        self.c_attn_type = c_attn_type
+        self.c_proj_type = c_proj_type
+        
         # Last linear layer of the MLP in the previous GPT2 block
         layer_num = "".join(filter(str.isdigit, prefix))
         previous_layer_num = str(int(layer_num) - 1)
-        ln_1_type = sharding_config.get(f"{prefix.replace(layer_num, previous_layer_num).replace('attn', '')}.ln_1", "replicated")
-        res_1_type = sharding_config.get(f"{prefix.replace(layer_num, previous_layer_num).replace('attn', '')}.res_1", "replicated")
+        ln_1_type = sharding_config.get(f"{prefix.replace(layer_num, previous_layer_num).replace('.attn', '')}.ln_1", "replicated")
+        res_1_type = sharding_config.get(f"{prefix.replace(layer_num, previous_layer_num).replace('.attn', '')}.res_1", "replicated")
 
         # c_attn
         c_attn_args = {
@@ -208,10 +208,22 @@ class GPT2Attention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        qkv, _ = self.c_attn(hidden_states)
+        num_tokens = attn_metadata.num_prefill_tokens + attn_metadata.num_decode_tokens
+
+        kwargs = {"num_tokens": num_tokens} if self.c_attn_type == "data" else {}
+        qkv, _ = self.c_attn(
+            hidden_states,
+            **kwargs,
+        )
+        
         q, k, v = qkv.chunk(chunks=3, dim=-1)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
-        attn_output, _ = self.c_proj(attn_output)
+
+        kwargs = {"num_tokens": num_tokens} if self.c_proj_type == "data" else {}
+        attn_output, _ = self.c_proj(
+            attn_output,
+            **kwargs,
+        )
 
         return attn_output
 
@@ -230,20 +242,17 @@ class GPT2MLP(nn.Module):
         hidden_size = config.hidden_size
 
         self.prefix = prefix
-        self.is_last_layer = str(config.n_layer - 1) in prefix
 
         # Get sharding types
         c_fc_type = sharding_config.get(f"{prefix}.c_fc", "column")
         c_proj_type = sharding_config.get(f"{prefix}.c_proj", "row")
-
-        # Last linear block of the attention block (before MLP)
-        attn_c_proj_type = sharding_config.get(f"{prefix.replace('mlp', 'attn')}.c_proj", "row")
-        ln_2_type = sharding_config.get(f"{prefix.replace('mlp', '')}.ln_2", "replicated")
-
-        # First linear layer of the next GPT2 block
-        layer_num = "".join(filter(str.isdigit, prefix))
-        next_layer_num = str(int(layer_num) + 1)
-        res_2_type = sharding_config.get(f"{prefix.replace('mlp', '')}.res_2", "replicated")
+        ln_2_type = sharding_config.get(f"{prefix.replace('.mlp', '')}.ln_2", "replicated")
+        res_2_type = sharding_config.get(f"{prefix.replace('.mlp', '')}.res_2", "replicated")
+        
+        self.c_fc_type = c_fc_type
+        self.c_proj_type = c_proj_type
+        self.ln_2_type = ln_2_type
+        self.res_2_type = res_2_type
 
         # c_fc
         c_fc_args = {
@@ -272,6 +281,13 @@ class GPT2MLP(nn.Module):
             **c_fc_args,
         )
 
+        # act
+        self.act = get_act_fn(
+            config.activation_function,
+            quant_config,
+            intermediate_size,
+        )
+
         # c_proj
         self.gather_output = False
         c_proj_args = {
@@ -292,24 +308,32 @@ class GPT2MLP(nn.Module):
                 c_proj_args["input_is_parallel"] = False
 
             # Gather only if the attn.c_fc for the next layer is not data
-            if self.is_last_layer or res_2_type != "data":
+            if res_2_type != "data":
                 self.gather_output = True
                 c_proj_args["gather_output"] = True
-
-        self.act = get_act_fn(
-            config.activation_function,
-            quant_config,
-            intermediate_size,
-        )
 
         self.c_proj = _linear_cls_from_config(c_proj_type)(
             **c_proj_args,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        h0, _ = self.c_fc(hidden_states)
+    def forward(
+        self, 
+        hidden_states: torch.Tensor,
+        num_tokens: Optional[int] = None,
+    ) -> torch.Tensor:
+        kwargs = {"num_tokens": num_tokens} if self.c_fc_type == "data" else {}
+        h0, _ = self.c_fc(
+            hidden_states,
+            **kwargs,
+        )
+
         h1 = self.act(h0)
-        h2, _ = self.c_proj(h1)
+        
+        kwargs = {"num_tokens": num_tokens} if self.c_proj_type == "data" else {}
+        h2, _ = self.c_proj(
+            h1,
+            **kwargs,
+        )
         return h2
 
 
@@ -333,6 +357,7 @@ class GPT2Block(nn.Module):
         # Last linear layer of the MLP in the last GPT2 block
         layer_num = "".join(filter(str.isdigit, prefix))
         self.is_first_layer = layer_num == "0"
+        self.is_last_layer = str(config.n_layer - 1) in prefix
         last_layer_num = str(int(layer_num) - 1)
         next_layer_num = str(int(layer_num) + 1)
 
@@ -424,7 +449,7 @@ class GPT2Block(nn.Module):
                 res_2_kwargs["input_is_parallel"] = False
             if self.res_1_type != "data":
                 res_2_kwargs["residual_is_parallel"] = False
-            if self.next_layer_ln_1_type != "data":
+            if self.is_last_layer or self.next_layer_ln_1_type != "data":
                 res_2_kwargs["gather_output"] = True
 
         self.res_2 = res_2_cls(**res_2_kwargs)
@@ -438,27 +463,51 @@ class GPT2Block(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        num_tokens = attn_metadata.num_prefill_tokens + attn_metadata.num_decode_tokens
+
         residual = hidden_states
-        hidden_states = self.ln_1(hidden_states)
+        kwargs = {"num_tokens": num_tokens} if self.ln_1_type == "data" else {}
+        hidden_states = self.ln_1(
+            hidden_states,
+            **kwargs,
+            )
         attn_output = self.attn(
             hidden_states=hidden_states,
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
         )
 
+        kwargs = {"num_tokens": num_tokens} if self.res_1_type == "data" else {}
         hidden_states = self.res_1(
             feedforward=attn_output,
-            residual=residual
+            residual=residual,
+            **kwargs,
         )
 
         residual = hidden_states
-        hidden_states = self.ln_2(hidden_states)
-        feed_forward_hidden_states = self.mlp(hidden_states)
+        kwargs = {"num_tokens": num_tokens} if self.ln_2_type == "data" else {}
+        try:
+            hidden_states = self.ln_2(
+                hidden_states,
+                **kwargs,
+            )
+        except Exception as e:
+            torch.distributed.breakpoint(0)
+        
+        feed_forward_hidden_states = self.mlp(
+            hidden_states,
+            num_tokens=num_tokens,
+        )
 
+        kwargs = {"num_tokens": num_tokens} if self.res_2_type == "data" else {}
+        # try:
         hidden_states = self.res_2(
             feedforward=feed_forward_hidden_states,
-            residual=residual
+            residual=residual,
+            **kwargs,
         )
+        # except:
+        #     torch.distributed.breakpoint(0)
 
         return hidden_states
 

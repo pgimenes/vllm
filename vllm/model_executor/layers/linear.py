@@ -1239,6 +1239,7 @@ class DataParallelLinear(LinearBase):
         self.gather_output = gather_output
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
+        self.world_size = get_tensor_model_parallel_world_size()
 
         # All the linear layer supports quant method.
         assert self.quant_method is not None
@@ -1269,12 +1270,25 @@ class DataParallelLinear(LinearBase):
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        x: torch.Tensor,
+        num_tokens: Optional[int] = None,
+    ) -> torch.Tensor:
         # Split input tensor along the data dimension
         # if it is not already parallel
         if self.input_is_parallel:
             input_parallel = x
+        elif not self.input_is_parallel and x.size(0) < self.world_size:
+            input_parallel = x
         else:
+            # Pad with zeros if necessary
+            in_size = x.size(0)
+            diff = in_size % self.world_size
+            if diff != 0:
+                pad_size = self.world_size - diff
+                x = torch.cat([x, torch.zeros(pad_size, *x.shape[1:], device=x.device)], dim=0)
+
             splitted = split_tensor_along_first_dim(
                 x, num_partitions=self.tp_size)
             input_parallel = splitted[self.tp_rank].contiguous()
@@ -1290,6 +1304,10 @@ class DataParallelLinear(LinearBase):
         if self.gather_output:
             output = tensor_model_parallel_all_gather(output_parallel,
                                                       dim=0)
+            
+            # Truncate output when this has been padded in another layer
+            if num_tokens is not None:
+                output = output[:num_tokens]
         else:
             output = output_parallel
         
