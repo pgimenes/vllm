@@ -8,6 +8,7 @@ import weakref
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set,
                     Tuple, Type, TypeVar, Union)
+from copy import copy
 
 import numpy as np
 import torch
@@ -52,6 +53,9 @@ from vllm.worker.model_runner_base import (
     _add_sampling_metadata_broadcastable_dict,
     _init_attn_metadata_from_tensor_dict,
     _init_sampling_metadata_from_tensor_dict)
+
+from accelerate import init_empty_weights
+from functools import reduce
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionBackend
@@ -806,6 +810,98 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             prompt_adapter_mapping=prompt_adapter_mapping,
             prompt_adapter_requests=prompt_adapter_requests)
 
+from vllm.model_executor.layers.linear import (
+    ReplicatedLinear,
+    RowParallelLinear,
+    ColumnParallelLinear,
+    DataParallelLinear,
+    QKVReplicatedLinear,
+    QKVRowParallelLinear,
+    QKVParallelLinear,
+    QKVDataParallelLinear,
+)
+
+from vllm.model_executor.layers.layer_norm import ReplicatedLayerNorm, DataParallelLayerNorm
+from vllm.model_executor.layers.residual import ReplicatedResidual, DataParallelResidual
+
+def _params_are_replicated(module):
+    rep_list = (
+        ReplicatedLinear,
+        ReplicatedLayerNorm, 
+        ReplicatedResidual,
+        QKVReplicatedLinear,
+        QKVDataParallelLinear,
+        DataParallelLinear,
+        DataParallelLayerNorm,
+        DataParallelResidual,
+    )
+    return isinstance(module, rep_list)
+
+def _params_are_column_sharded(module):
+    col_list = (
+        ColumnParallelLinear,
+        QKVParallelLinear,
+    )
+    return isinstance(module, col_list)
+
+def _params_are_row_sharded(module):
+    row_list = (
+        RowParallelLinear,
+        QKVRowParallelLinear,
+    )
+    return isinstance(module, row_list)
+
+def deepgetattr(obj, attr):
+    """Recurses through an attribute chain to get the ultimate value."""
+    return reduce(getattr, attr.split("."), obj)
+
+def _link_model_parameters(parent_model, child_model):
+    """Link the parameters of the child model to the equivalent parameters of the parent model.
+
+    Args:
+        parent_model: The parent model.
+        child_model: The child model.
+    """
+
+    tp_rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+
+    for module_name, module in child_model.named_modules():
+        # skip if this has children
+        if len(list(module.children())) > 0:
+            continue
+
+        parent_module = deepgetattr(parent_model, module_name)
+
+        for param_name, param in module.named_parameters():
+            parent_param = getattr(parent_module, param_name)
+            if type(parent_module) == type(module):
+                module.register_parameter(param_name, parent_param)
+            elif _params_are_replicated(parent_module) and _params_are_replicated(module):
+                module.register_parameter(param_name, parent_param)
+            elif _params_are_replicated(parent_module) and _params_are_column_sharded(module):
+                
+                if param.dim() == 1:
+                    size_per_partition = parent_param.shape[0] // world_size
+                    param_view = parent_param[tp_rank * size_per_partition : (tp_rank + 1) * size_per_partition]
+                else:
+                    size_per_partition = parent_param.shape[0] // world_size
+                    param_view = parent_param[tp_rank * size_per_partition : (tp_rank + 1) * size_per_partition, :]
+                
+                module.register_parameter(param_name, nn.Parameter(param_view))
+            
+            elif _params_are_replicated(parent_module) and _params_are_row_sharded(module):
+                if param.dim() == 1:
+                    module.register_parameter(param_name, nn.Parameter(parent_param))
+                    continue
+                
+                size_per_partition = parent_param.shape[1] // world_size
+                param_view = parent_param[:, tp_rank * size_per_partition : (tp_rank + 1) * size_per_partition]
+                module.register_parameter(param_name, nn.Parameter(param_view))
+            else:
+                raise ValueError(f"Unsupported parameter sharing between {type(parent_module)} and {type(module)}")
+            
+    return child_model
 
 class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
     """
@@ -926,11 +1022,28 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                                    parallel_config=self.parallel_config,
                                    scheduler_config=self.scheduler_config,
                                    cache_config=self.cache_config)
-
+            
+            if self.parallel_config.enable_dynamic_resharding:
+                logger.info("Creating model executable for decoding.")
+                decode_parallel_config = copy(self.parallel_config)
+                decode_parallel_config.sharding_config = self.parallel_config.decode_sharding
+                with init_empty_weights():
+                    self.decode_model = get_model(model_config=self.model_config,
+                                            device_config=self.device_config,
+                                            load_config=self.load_config,
+                                            lora_config=self.lora_config,
+                                            parallel_config=decode_parallel_config,
+                                            scheduler_config=self.scheduler_config,
+                                            cache_config=self.cache_config)
+                    
+                
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB",
                     self.model_memory_usage / float(2**30))
 
+        if self.parallel_config.enable_dynamic_resharding:
+            self.decode_model = _link_model_parameters(self.model, self.decode_model)
+        
         if self.lora_config:
             assert supports_lora(self.model), "Model does not support LoRA"
             assert not supports_multimodal(
@@ -1438,6 +1551,9 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             graph_batch_size = model_input.input_tokens.shape[0]
             model_executable = self.graph_runners[virtual_engine][
                 graph_batch_size]
+        elif self.parallel_config.enable_dynamic_resharding:
+            is_prompt = model_input.attn_metadata.num_prefill_tokens > 0
+            model_executable = self.model if is_prompt else self.decode_model
         else:
             model_executable = self.model
 
@@ -1451,30 +1567,6 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_start = torch.cuda.Event(enable_timing=True)
             model_forward_end = torch.cuda.Event(enable_timing=True)
             model_forward_start.record()
-
-        # def _get_sharding_config(data_size: int):
-        #     # unpickle solution dictionary
-        #     pass
-
-        # if model_input.is_prompt:
-        #     data_size = model_input.input_tokens.size(0)
-        #     self.token_length_history.append(data_size)
-
-        #     closest = self._current_sharding_soln
-        #     if len (self.token_length_history) > self.rolling_window_size:
-        #         def find_closest(num_list, target):
-        #             closest = min(num_list, key=lambda x: abs(x - target))
-        #             return closest
-                
-        #         avg = sum(self.token_length_history[-self.rolling_window_size:]) / self.rolling_window_size
-        #         closest = find_closest(self.token_length_range, avg)
-
-        #     if closest != self._current_sharding_soln:
-        #         logger.info(f"Resharding from data_size={self._current_sharding_soln} -> {closest}")
-        #         self._current_sharding_soln = closest
-        #         self.parallel_config.sharding_config = _get_sharding_config(token_length = closest)
-        #         self.load_model()
-        #         model_executable = self.model
 
         hidden_or_intermediate_states = model_executable(
             input_ids=model_input.input_tokens,

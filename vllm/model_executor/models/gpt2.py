@@ -486,13 +486,10 @@ class GPT2Block(nn.Module):
 
         residual = hidden_states
         kwargs = {"num_tokens": num_tokens} if self.ln_2_type == "data" else {}
-        try:
-            hidden_states = self.ln_2(
-                hidden_states,
-                **kwargs,
-            )
-        except Exception as e:
-            torch.distributed.breakpoint(0)
+        hidden_states = self.ln_2(
+            hidden_states,
+            **kwargs,
+        )
         
         feed_forward_hidden_states = self.mlp(
             hidden_states,
@@ -500,14 +497,11 @@ class GPT2Block(nn.Module):
         )
 
         kwargs = {"num_tokens": num_tokens} if self.res_2_type == "data" else {}
-        # try:
         hidden_states = self.res_2(
             feedforward=feed_forward_hidden_states,
             residual=residual,
             **kwargs,
         )
-        # except:
-        #     torch.distributed.breakpoint(0)
 
         return hidden_states
 

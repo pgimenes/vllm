@@ -832,6 +832,7 @@ class ParallelConfig:
         placement_group: Optional["PlacementGroup"] = None,
         distributed_executor_backend: Optional[Union[
             str, Type["ExecutorBase"]]] = None,
+        enable_dynamic_resharding: bool = False,
         sharding_config: Optional[Dict[str, str]] = None,
         prefill_sharding: Optional[Dict[str, str]] = None,
         decode_sharding: Optional[Dict[str, str]] = None,
@@ -846,6 +847,7 @@ class ParallelConfig:
         self.placement_group = placement_group
         self.world_size = pipeline_parallel_size * self.tensor_parallel_size
 
+        self.enable_dynamic_resharding = enable_dynamic_resharding
         self.sharding_config = {} if sharding_config is None else sharding_config
         self.prefill_sharding = {} if prefill_sharding is None else prefill_sharding
         self.decode_sharding = {} if decode_sharding is None else decode_sharding
