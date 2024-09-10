@@ -26,7 +26,6 @@ class CacheEngine:
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
         device_config: DeviceConfig,
-        parallelism_config: dict = {},
     ) -> None:
         self.cache_config = cache_config
         self.model_config = model_config

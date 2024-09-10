@@ -867,9 +867,12 @@ class ParallelConfig:
         self.world_size = pipeline_parallel_size * self.tensor_parallel_size
 
         self.enable_dynamic_resharding = enable_dynamic_resharding
-        self.sharding_config = {} if sharding_config is None else sharding_config
         self.prefill_sharding = {} if prefill_sharding is None else prefill_sharding
         self.decode_sharding = {} if decode_sharding is None else decode_sharding
+        
+        # If dynamic resharding is enabled, initialize with the prefill sharding
+        # Otherwise, take the decode sharding
+        self.sharding_config = prefill_sharding if enable_dynamic_resharding else decode_sharding
 
         if worker_use_ray:
             if self.distributed_executor_backend is None:
