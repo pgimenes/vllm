@@ -3,9 +3,101 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from torch import Size
 
 from vllm.model_executor.custom_op import CustomOp
 
+from typing import List, Optional, Tuple, Union
+_shape_t = Union[int, List[int], Size]
+
+class LayerNormBase(nn.LayerNorm):
+    def __init__(
+        self,
+        normalized_shape: _shape_t,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+        prefix: Optional[str] = None,
+    ):
+        super(LayerNormBase, self).__init__(
+            normalized_shape=normalized_shape,
+            eps=eps,
+            elementwise_affine=elementwise_affine,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+        )
+
+        self.prefix = prefix
+
+class ReplicatedLayerNorm(LayerNormBase):
+    def forward(self, input_):
+        return super(ReplicatedLayerNorm, self).forward(input_)
+
+class DataParallelLayerNorm(LayerNormBase):
+    def __init__(
+        self,
+        normalized_shape: _shape_t,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+        input_is_parallel: bool = True,
+        gather_output: bool = False,
+        prefix: Optional[str] = None,
+    ):
+        super(DataParallelLayerNorm, self).__init__(
+            normalized_shape,
+            eps=eps,
+            elementwise_affine=elementwise_affine,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+            prefix=prefix,
+        )
+
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.world_size = get_tensor_model_parallel_world_size()
+
+        self.input_is_parallel = input_is_parallel
+        self.gather_output = gather_output
+
+    def forward(
+        self,
+        input_,
+        num_tokens: Optional[int] = None,
+    ):
+        # Parallelize feedforward input if necessary
+        if self.input_is_parallel:
+            input_parallel = input_
+        elif not self.input_is_parallel and input_.size(0) < self.world_size:
+            input_parallel = input_
+        else:
+            # Pad with zeros if necessary
+            in_size = input_.size(0)
+            diff = in_size % self.world_size
+            if diff != 0:
+                pad_size = self.world_size - diff
+                input_ = torch.cat([input_, torch.zeros(pad_size, *input_.shape[1:], device=input_.device)], dim=0)
+
+            splitted = split_tensor_along_first_dim(
+                input_, num_partitions=self.tp_size)
+            input_parallel = splitted[self.tp_rank].contiguous()
+
+        out = super(DataParallelLayerNorm, self).forward(input_parallel)
+
+        if self.gather_output:
+            out = tensor_model_parallel_all_gather(out, dim=0)
+
+            # Truncate output when this has been padded in another layer
+            if num_tokens is not None:
+                out = out[:num_tokens]
+
+        return out
 
 class RMSNorm(CustomOp):
     """Root mean square normalization.
@@ -96,6 +188,104 @@ class RMSNorm(CustomOp):
         s += f", eps={self.variance_epsilon}"
         return s
 
+from vllm.distributed import (get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size,
+                              split_tensor_along_first_dim,
+                              tensor_model_parallel_all_gather)
+
+class DataParallelRMSNorm(RMSNorm):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        input_is_parallel: bool = True,
+        residual_is_parallel: bool = True,
+        gather_output: bool = False,
+        gather_output_residual: bool = False,
+    ) -> None:
+        super().__init__(hidden_size, eps)
+
+        self.input_is_parallel = input_is_parallel
+        self.residual_is_parallel = residual_is_parallel
+        self.gather_output = gather_output
+        self.gather_output_residual = gather_output_residual
+
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        num_tokens: Optional[int] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # Check if input needs to be parallelized
+        if self.input_is_parallel:
+            x_parallel = x
+        elif not self.input_is_parallel and x.size(0) < self.tp_size:
+            x_parallel = x
+        else:
+            # Pad with zeros if necessary
+            in_size = x.size(0)
+            diff = in_size % self.tp_size
+            if diff != 0:
+                pad_size = self.tp_size - diff
+                x = torch.cat([x, torch.zeros(pad_size, *x.shape[1:], device=x.device)], dim=0)
+
+            splitted = split_tensor_along_first_dim(
+                x,
+                num_partitions=self.tp_size,
+            )
+            x_parallel = splitted[self.tp_rank]
+
+        # Check if residual needs to be parallelized
+        if residual is None:
+            residual_parallel = None
+        else:
+            if self.residual_is_parallel:
+                residual_parallel = residual
+            elif not self.residual_is_parallel and residual.size(0) < self.tp_size:
+                residual_parallel = residual
+            else:
+                # Pad with zeros if necessary
+                in_size = residual.size(0)
+                diff = in_size % self.tp_size
+                if diff != 0:
+                    pad_size = self.tp_size - diff
+                    residual = torch.cat([residual, torch.zeros(pad_size, *residual.shape[1:], device=residual.device)], dim=0)
+                    
+                splitted = split_tensor_along_first_dim(
+                    residual,
+                    num_partitions=self.tp_size,
+                )
+                residual_parallel = splitted[self.tp_rank]
+
+        out = super().forward(x_parallel, residual_parallel)
+
+        if residual is not None:
+            out, out_residual = out
+
+        # Gather output if necessary
+        if self.gather_output:
+            out = tensor_model_parallel_all_gather(out, dim=0)
+
+            # Truncate output when this has been padded in another layer
+            if num_tokens is not None:
+                out = out[:num_tokens]
+
+        if residual is None:
+            return out
+        
+        else:
+            # Gather output residual if necessary
+            if self.gather_output_residual:
+                out_residual = tensor_model_parallel_all_gather(out_residual, dim=0)
+                
+                # Truncate output when this has been padded in another layer
+                if num_tokens is not None:
+                    out_residual = out_residual[:num_tokens]
+
+            return out, out_residual
 
 class GemmaRMSNorm(CustomOp):
     """RMS normalization for Gemma.

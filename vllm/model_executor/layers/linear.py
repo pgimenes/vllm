@@ -1391,3 +1391,26 @@ class QKVDataParallelLinear(DataParallelLinear):
             quant_config=quant_config,
             prefix=prefix,
         )
+
+class MergedDataParallelLinear(DataParallelLinear):
+    def __init__(self,
+                 input_size: int,
+                 output_sizes: List[int],
+                 bias: bool = True,
+                 input_is_parallel: bool = True,
+                 gather_output: bool = False,
+                 skip_bias_add: bool = False,
+                 params_dtype: Optional[torch.dtype] = None,
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = ""):
+        
+        self.output_sizes = output_sizes
+        super().__init__(input_size=input_size,
+                    output_size=sum(output_sizes),
+                    bias=bias,
+                    input_is_parallel=input_is_parallel,
+                    gather_output=gather_output,
+                    skip_bias_add=skip_bias_add,
+                    params_dtype=params_dtype,
+                    quant_config=quant_config,
+                    prefix=prefix)

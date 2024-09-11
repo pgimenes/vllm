@@ -1192,7 +1192,8 @@ class MaseModelLoader(DefaultModelLoader):
                                         scheduler_config, parallel_config)
 
             # Pass 1: run autosharding if sharding config is not provided
-            if parallel_config.sharding_config is None or parallel_config.sharding_config == {}:
+            enable_autosharding = hasattr(parallel_config, "enable_autosharding") and parallel_config.enable_autosharding is not None
+            if enable_autosharding:
                 sharding_config = _run_mase_autosharding(model, parallel_config)
                 parallel_config.sharding_config = sharding_config
 

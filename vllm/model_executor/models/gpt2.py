@@ -31,18 +31,6 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.layers.activation import get_act_fn
-from vllm.model_executor.layers.linear import (
-    ReplicatedLinear,
-    RowParallelLinear,
-    ColumnParallelLinear,
-    DataParallelLinear,
-    QKVReplicatedLinear,
-    QKVRowParallelLinear,
-    QKVParallelLinear,
-    QKVDataParallelLinear,
-)
-from vllm.model_executor.layers.layer_norm import ReplicatedLayerNorm, DataParallelLayerNorm
-from vllm.model_executor.layers.residual import ReplicatedResidual, DataParallelResidual
 
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
@@ -58,49 +46,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
-from .utils import is_pp_missing_parameter, make_layers
-
-
-def _linear_cls_from_config(config: str):
-    if config == "replicated":
-        return ReplicatedLinear
-    if config == "column":
-        return ColumnParallelLinear
-    if config == "row":
-        return RowParallelLinear
-    if config == "data":
-        return DataParallelLinear
-
-    raise ValueError(f"Unknown linear config: {config}")
-
-
-def _qkv_linear_cls_from_config(config: str):
-    if config == "replicated":
-        return QKVReplicatedLinear
-    if config == "column":
-        return QKVParallelLinear
-    if config == "row":
-        return QKVRowParallelLinear
-    if config == "data":
-        return QKVDataParallelLinear
-
-    raise ValueError(f"Unknown linear config: {config}")
-
-def _layer_norm_cls_from_config(config: str):
-    if config == "replicated":
-        return ReplicatedLayerNorm
-    if config == "data":
-        return DataParallelLayerNorm
-
-    raise ValueError(f"Unknown layer norm config: {config}")
-
-def _residual_cls_from_config(config: str):
-    if config == "replicated":
-        return ReplicatedResidual
-    if config == "data":
-        return DataParallelResidual
-
-    raise ValueError(f"Unknown residual config: {config}")
+from .utils import is_pp_missing_parameter, make_layers, _linear_cls_from_config, _qkv_linear_cls_from_config, _layer_norm_cls_from_config, _residual_cls_from_config
 
 class GPT2Attention(nn.Module):
 

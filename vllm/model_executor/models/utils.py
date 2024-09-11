@@ -15,6 +15,18 @@ from vllm.multimodal.base import NestedTensors
 from vllm.sequence import IntermediateTensors
 from vllm.utils import is_pin_memory_available
 
+from vllm.model_executor.layers.linear import (
+    ReplicatedLinear,
+    RowParallelLinear,
+    ColumnParallelLinear,
+    DataParallelLinear,
+    QKVReplicatedLinear,
+    QKVRowParallelLinear,
+    QKVParallelLinear,
+    QKVDataParallelLinear,
+)
+from vllm.model_executor.layers.layernorm import ReplicatedLayerNorm, DataParallelLayerNorm, RMSNorm, DataParallelRMSNorm
+from vllm.model_executor.layers.residual import ReplicatedResidual, DataParallelResidual
 
 def filter_weights(weights: Iterable[Tuple[str, torch.Tensor]], prefix: str):
     """
@@ -295,3 +307,52 @@ def make_empty_intermediate_tensors_factory(keys: List[str], hidden_size: int):
         })
 
     return make_empty_intermediate_tensors
+
+def _linear_cls_from_config(config: str):
+    if config == "replicated":
+        return ReplicatedLinear
+    if config == "column":
+        return ColumnParallelLinear
+    if config == "row":
+        return RowParallelLinear
+    if config == "data":
+        return DataParallelLinear
+
+    raise ValueError(f"Unknown linear config: {config}")
+
+
+def _qkv_linear_cls_from_config(config: str):
+    if config == "replicated":
+        return QKVReplicatedLinear
+    if config == "column":
+        return QKVParallelLinear
+    if config == "row":
+        return QKVRowParallelLinear
+    if config == "data":
+        return QKVDataParallelLinear
+
+    raise ValueError(f"Unknown linear config: {config}")
+
+def _layer_norm_cls_from_config(config: str):
+    if config == "replicated":
+        return ReplicatedLayerNorm
+    if config == "data":
+        return DataParallelLayerNorm
+
+    raise ValueError(f"Unknown layer norm config: {config}")
+
+def _rms_norm_cls_from_config(config: str):
+    if config == "replicated":
+        return RMSNorm
+    if config == "data":
+        return DataParallelRMSNorm
+
+    raise ValueError(f"Unknown RMS norm config: {config}")
+
+def _residual_cls_from_config(config: str):
+    if config == "replicated":
+        return ReplicatedResidual
+    if config == "data":
+        return DataParallelResidual
+
+    raise ValueError(f"Unknown residual config: {config}")

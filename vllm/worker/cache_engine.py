@@ -78,7 +78,10 @@ class CacheEngine:
         for layer in range(self.num_attention_layers):
 
             num_kv_heads = self.num_kv_heads
-            attn_type = self.parallel_config.sharding_config.get(f"transformer.h.{layer}.attn.attn", None)
+
+            # todo: extract attention parallelism strategy for each layer
+            attn_type = "head"
+            
             if (attn_type != "replicated"):
                 num_kv_heads //= self.parallel_config.tensor_parallel_size
 
@@ -126,7 +129,9 @@ class CacheEngine:
 
         total = 0
         for layer in range(num_attention_layers):
-            attn_type = parallel_config.sharding_config.get(f"transformer.h.{layer}.attn.attn", None)
+            
+            # todo: extract attention parallelism strategy for each layer
+            attn_type = "head"
             if (attn_type == "replicated"):
                 num_heads = model_config.get_total_num_kv_heads()
             else:

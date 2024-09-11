@@ -821,21 +821,33 @@ from vllm.model_executor.layers.linear import (
     QKVRowParallelLinear,
     QKVParallelLinear,
     QKVDataParallelLinear,
+    MergedDataParallelLinear,
 )
 
-from vllm.model_executor.layers.layer_norm import ReplicatedLayerNorm, DataParallelLayerNorm
-from vllm.model_executor.layers.residual import ReplicatedResidual, DataParallelResidual
+from vllm.model_executor.layers.layernorm import (
+    ReplicatedLayerNorm,
+    DataParallelLayerNorm, 
+    DataParallelRMSNorm, 
+    RMSNorm,
+)
+from vllm.model_executor.layers.residual import (
+    ReplicatedResidual,
+    DataParallelResidual,
+)
 
 def _params_are_replicated(module):
     rep_list = (
         ReplicatedLinear,
         ReplicatedLayerNorm, 
         ReplicatedResidual,
+        RMSNorm,
         QKVReplicatedLinear,
         QKVDataParallelLinear,
         DataParallelLinear,
         DataParallelLayerNorm,
+        DataParallelRMSNorm,
         DataParallelResidual,
+        MergedDataParallelLinear,
     )
     return isinstance(module, rep_list)
 
