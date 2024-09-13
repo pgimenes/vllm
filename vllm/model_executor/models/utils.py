@@ -25,7 +25,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     QKVDataParallelLinear,
 )
-from vllm.model_executor.layers.layernorm import ReplicatedLayerNorm, DataParallelLayerNorm, RMSNorm, DataParallelRMSNorm
+from vllm.model_executor.layers.layernorm import ReplicatedLayerNorm, DataParallelLayerNorm, RMSNorm, DataParallelRMSNorm, GemmaRMSNorm, DataParallelGemmaRMSNorm
 from vllm.model_executor.layers.residual import ReplicatedResidual, DataParallelResidual
 
 def filter_weights(weights: Iterable[Tuple[str, torch.Tensor]], prefix: str):
@@ -346,6 +346,14 @@ def _rms_norm_cls_from_config(config: str):
         return RMSNorm
     if config == "data":
         return DataParallelRMSNorm
+
+    raise ValueError(f"Unknown RMS norm config: {config}")
+
+def _gemma_rms_norm_cls_from_config(config: str):
+    if config == "replicated":
+        return GemmaRMSNorm
+    if config == "data":
+        return DataParallelGemmaRMSNorm
 
     raise ValueError(f"Unknown RMS norm config: {config}")
 
