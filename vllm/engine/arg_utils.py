@@ -91,8 +91,7 @@ class EngineArgs:
     tensor_parallel_size: int = 1
     max_parallel_loading_workers: Optional[int] = None
     enable_dynamic_resharding: bool = False
-    prefill_sharding: Optional[Dict[str, str]] = None
-    decode_sharding: Optional[Dict[str, str]] = None
+    num_parallel_layers: Optional[int] = None
     block_size: int = 16
     enable_prefix_caching: bool = False
     disable_sliding_window: bool = False
@@ -771,6 +770,18 @@ class EngineArgs:
             default=None,
             help="override or set neuron device configuration.")
 
+        parser.add_argument(
+            "--enable-dynamic-resharding",
+            action="store_true",
+            help="Enable dynamic reshaping of tensors for tensor parallelism."
+        )
+        parser.add_argument(
+            "--num-parallel-layers",
+            type=int,
+            default=None,
+            help="Number of layers to parallelize in tensor parallelism."
+        )
+
         return parser
 
     @classmethod
@@ -878,8 +889,7 @@ class EngineArgs:
             ray_workers_use_nsight=self.ray_workers_use_nsight,
             distributed_executor_backend=self.distributed_executor_backend,
             enable_dynamic_resharding=self.enable_dynamic_resharding,
-            prefill_sharding=self.prefill_sharding,
-            decode_sharding=self.decode_sharding)
+            num_parallel_layers=self.num_parallel_layers)
             
 
         max_model_len = model_config.max_model_len

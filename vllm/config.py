@@ -852,9 +852,7 @@ class ParallelConfig:
         distributed_executor_backend: Optional[Union[
             str, Type["ExecutorBase"]]] = None,
         enable_dynamic_resharding: bool = False,
-        sharding_config: Optional[Dict[str, str]] = None,
-        prefill_sharding: Optional[Dict[str, str]] = None,
-        decode_sharding: Optional[Dict[str, str]] = None,
+        num_parallel_layers: Optional[int] = None,
     ) -> None:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
@@ -867,12 +865,8 @@ class ParallelConfig:
         self.world_size = pipeline_parallel_size * self.tensor_parallel_size
 
         self.enable_dynamic_resharding = enable_dynamic_resharding
-        self.prefill_sharding = {} if prefill_sharding is None else prefill_sharding
-        self.decode_sharding = {} if decode_sharding is None else decode_sharding
-        
-        # If dynamic resharding is enabled, initialize with the prefill sharding
-        # Otherwise, take the decode sharding
-        self.sharding_config = prefill_sharding if enable_dynamic_resharding else decode_sharding
+        self.num_parallel_layers = num_parallel_layers
+        self.sharding_config = {}
 
         if worker_use_ray:
             if self.distributed_executor_backend is None:

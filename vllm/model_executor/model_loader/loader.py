@@ -1192,17 +1192,38 @@ class MaseModelLoader(DefaultModelLoader):
                                         lora_config, cache_config,
                                         scheduler_config, parallel_config)
 
-            # Pass 1: run autosharding if sharding config is not provided
-            enable_autosharding = hasattr(parallel_config, "enable_autosharding") and parallel_config.enable_autosharding is not None
-            if enable_autosharding:
-                sharding_config = _run_mase_autosharding(model, parallel_config)
-                parallel_config.sharding_config = sharding_config
+            # Do stuff...
+
+            # 1. Extract model graph
+            # if get_tensor_model_parallel_rank() == 0:
+            #     from .latency_prediction import build_model_graph
+            #     import torch.distributed as dist
+            #     model, pass_outs = build_model_graph(model)
+            #     model_graph = pass_outs["model_graph"]
+            #     sharding_config = pass_outs["sharding_config"]
+            #     parallel_config.sharding_config = sharding_config
+
+            #     # Save model graph
+            #     torch.save(model_graph, "model_graph.pt")
+
+            config = {}
+            num_replicated_layers = model_config.get_num_layers(parallel_config) - parallel_config.num_parallel_layers
+            for layer_idx in range(num_replicated_layers):
+                config[f"model.layers.{layer_idx}.input_layernorm"] = "data"
+                config[f"model.layers.{layer_idx}.self_attn.qkv_proj"] = "data"
+                config[f"model.layers.{layer_idx}.self_attn.attn"] = "replicated"
+                config[f"model.layers.{layer_idx}.self_attn.o_proj"] = "data"
+                config[f"model.layers.{layer_idx}.post_attention_layernorm"] = "data"
+                config[f"model.layers.{layer_idx}.mlp.gate_up_proj"] = "data"
+                config[f"model.layers.{layer_idx}.mlp.down_proj"] = "data"
+
+            parallel_config.sharding_config = config
 
             # After a series of passes, reinstantiate the model
             model = _initialize_model(model_config, self.load_config,
                                     lora_config, cache_config,
                                     scheduler_config, parallel_config)
-            
+
             # Load weights from checkpoint
             # model.load_weights(
             #     self._get_weights_iterator(model_config.model,
