@@ -37,8 +37,7 @@ from vllm.distributed import (get_tensor_model_parallel_rank,
                               tensor_model_parallel_all_gather,
                               split_tensor_along_first_dim)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig)
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.sampler import Sampler, SamplerOutput
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
@@ -527,7 +526,7 @@ class GPT2Model(nn.Module):
         return hidden_states
 
 
-class GPT2LMHeadModel(nn.Module):
+class GPT2LMHeadModel(nn.Module, SupportsPP):
 
     def __init__(
         self,
@@ -551,6 +550,8 @@ class GPT2LMHeadModel(nn.Module):
                                           self.config.hidden_size)
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = Sampler()
+        self.make_empty_intermediate_tensors = (
+            self.transformer.make_empty_intermediate_tensors)
 
     def forward(
         self,

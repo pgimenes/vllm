@@ -320,6 +320,9 @@ def get_moe_configs(E: int, N: int,
 
     # If no optimized configuration is available, we will use the default
     # configuration
+    logger.warning(
+        ("Using default MoE config. Performance might be sub-optimal! "
+         "Config file not found at %s"), config_file_path)
     return None
 
 
@@ -445,7 +448,7 @@ def grouped_topk(hidden_states: torch.Tensor,
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    return topk_weights, topk_ids.to(torch.int32)
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
 def get_config_dtype_str(dtype: torch.dtype,
