@@ -1415,3 +1415,23 @@ class MergedDataParallelLinear(DataParallelLinear):
                     params_dtype=params_dtype,
                     quant_config=quant_config,
                     prefix=prefix)
+
+
+class MergedReplicatedLinear(ReplicatedLinear):
+    def __init__(self,
+                 input_size: int,
+                 output_sizes: List[int],
+                 bias: bool = True,
+                 skip_bias_add: bool = False,
+                 params_dtype: Optional[torch.dtype] = None,
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = ""):
+        
+        self.output_sizes = output_sizes
+        super().__init__(input_size=input_size,
+                    output_size=sum(output_sizes),
+                    bias=bias,
+                    skip_bias_add=skip_bias_add,
+                    params_dtype=params_dtype,
+                    quant_config=quant_config,
+                    prefix=prefix)

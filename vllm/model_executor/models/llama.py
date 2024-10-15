@@ -34,7 +34,7 @@ from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
-                                               MergedDataParallelLinear)
+                                               MergedDataParallelLinear, MergedReplicatedLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
@@ -90,6 +90,8 @@ class LlamaMLP(nn.Module):
             gate_up_proj_cls = MergedColumnParallelLinear
         elif self.gate_up_proj_type == "data":
             gate_up_proj_cls = MergedDataParallelLinear
+        elif self.gate_up_proj_type == "replicated":
+            gate_up_proj_cls = MergedReplicatedLinear
         else:
             raise ValueError(f"Unsupported gate_up_proj type: {self.gate_up_proj_type}")
 
@@ -173,13 +175,26 @@ class LlamaAttention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         
+        # get sharding config for each submodule
+        input_layernorm_type = sharding_config.get(f"{prefix.replace('.self_attn', '')}.input_layernorm", "replicated")
+        self.qkv_proj_type = sharding_config.get(f"{prefix}.qkv_proj", "column")
+        self.attn_type = sharding_config.get(f"{prefix}.attn", "column")
+        self.o_proj_type = sharding_config.get(f"{prefix}.o_proj", "row")
+        post_attention_layernorm_type = sharding_config.get(f"{prefix.replace('.self_attn', '')}.post_attention_layernorm", "replicated")
+
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
+        self.total_num_kv_heads = num_kv_heads
         assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        
+        if self.attn_type == "replicated":
+            self.num_heads = self.total_num_heads
+            self.num_kv_heads = self.total_num_kv_heads
+        else:
+            self.num_heads = self.total_num_heads // tp_size
+            self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
 
         # KV heads
-        self.total_num_kv_heads = num_kv_heads
         if self.total_num_kv_heads >= tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
@@ -188,21 +203,13 @@ class LlamaAttention(nn.Module):
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-
+            
         # MistralConfig has an optional head_dim introduced by Mistral-Nemo
         self.head_dim = getattr(config, "head_dim",
                                 self.hidden_size // self.total_num_heads)
         
-        # get sharding config for each submodule
-        input_layernorm_type = sharding_config.get(f"{prefix.replace('.self_attn', '')}.input_layernorm", "replicated")
-        self.qkv_proj_type = sharding_config.get(f"{prefix}.qkv_proj", "column")
-        self.attn_type = sharding_config.get(f"{prefix}.attn", "column")
-        self.o_proj_type = sharding_config.get(f"{prefix}.o_proj", "row")
-        post_attention_layernorm_type = sharding_config.get(f"{prefix.replace('.self_attn', '')}.post_attention_layernorm", "replicated")
-        
         # Parameters used for split
-        if self.qkv_proj_type == "data":
+        if self.qkv_proj_type in ["data", "replicated"]:
             self.q_size = self.total_num_heads * self.head_dim
             self.kv_size = self.total_num_kv_heads * self.head_dim
         else:
@@ -255,10 +262,14 @@ class LlamaAttention(nn.Module):
             "cache_config": cache_config,
             "quant_config": quant_config,
         }
-        if self.qkv_proj_type != "column":
-            attn_kwargs["input_is_parallel"] = False
-        if self.o_proj_type != "row":
-            attn_kwargs["gather_output"] = True
+        if self.attn_type == "replicated":
+            attn_kwargs["num_heads"] = self.total_num_heads
+        else:
+            if self.qkv_proj_type != "column":
+                attn_kwargs["input_is_parallel"] = False
+            if self.o_proj_type != "row":
+                attn_kwargs["gather_output"] = True
+
         self.attn = Attention(**attn_kwargs)
         
         # o_proj

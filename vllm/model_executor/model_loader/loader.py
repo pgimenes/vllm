@@ -1209,13 +1209,13 @@ class MaseModelLoader(DefaultModelLoader):
             config = {}
             num_replicated_layers = model_config.get_num_layers(parallel_config) - parallel_config.num_parallel_layers
             for layer_idx in range(num_replicated_layers):
-                config[f"model.layers.{layer_idx}.input_layernorm"] = "data"
-                config[f"model.layers.{layer_idx}.self_attn.qkv_proj"] = "data"
+                config[f"model.layers.{layer_idx}.input_layernorm"] = "replicated"
+                config[f"model.layers.{layer_idx}.self_attn.qkv_proj"] = "replicated"
                 config[f"model.layers.{layer_idx}.self_attn.attn"] = "replicated"
-                config[f"model.layers.{layer_idx}.self_attn.o_proj"] = "data"
-                config[f"model.layers.{layer_idx}.post_attention_layernorm"] = "data"
-                config[f"model.layers.{layer_idx}.mlp.gate_up_proj"] = "data"
-                config[f"model.layers.{layer_idx}.mlp.down_proj"] = "data"
+                config[f"model.layers.{layer_idx}.self_attn.o_proj"] = "replicated"
+                config[f"model.layers.{layer_idx}.post_attention_layernorm"] = "replicated"
+                config[f"model.layers.{layer_idx}.mlp.gate_up_proj"] = "replicated"
+                config[f"model.layers.{layer_idx}.mlp.down_proj"] = "replicated"
 
             parallel_config.sharding_config = config
 
